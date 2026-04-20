@@ -48,8 +48,6 @@ def write_result_csv(path: str, result: SearchResult):
 
 def write_result_geojson(path: str, result: SearchResult):
     features = []
-
-    # Individual point features
     for i, (lon, lat) in enumerate(result.points):
         profile_pt = result.profile[i] if result.profile else None
         z_samp = round(result.z_sampled[i], 4) if result.z_sampled else None
@@ -72,7 +70,6 @@ def write_result_geojson(path: str, result: SearchResult):
             }
         })
 
-    # LineString connecting all points in order
     if len(result.points) >= 2:
         features.append({
             "type": "Feature",
@@ -195,7 +192,7 @@ class App(tk.Tk):
         self._log.configure(yscrollcommand=scrollbar.set)
 
     # ------------------------------------------------------------------
-    # Settings persistence
+    # Settings
     # ------------------------------------------------------------------
 
     def _load_settings(self):
@@ -246,7 +243,7 @@ class App(tk.Tk):
                 self._param_vars["z_field"].set(z_candidates[0].strip())
 
     # ------------------------------------------------------------------
-    # Logging
+    # Logging — both direct (main thread) and thread-safe variant
     # ------------------------------------------------------------------
 
     def _log_write(self, msg: str):
@@ -254,6 +251,10 @@ class App(tk.Tk):
         self._log.insert("end", msg + "\n")
         self._log.see("end")
         self._log.configure(state="disabled")
+
+    def _log_write_safe(self, msg: str):
+        """Thread-safe: schedule log write on the main thread."""
+        self.after(0, self._log_write, msg)
 
     def _progress_set(self, value: float):
         self._progress["value"] = value * 100
@@ -301,12 +302,12 @@ class App(tk.Tk):
         def worker():
             try:
                 cols = read_csv_columns(csv_path)
-                self._log_write(f"CSV columns: {cols}")
-                self._log_write(f"Using bearing='{bearing_field}', z='{z_field}'")
+                self._log_write_safe(f"CSV columns: {cols}")
+                self._log_write_safe(f"Using bearing='{bearing_field}', z='{z_field}'")
 
                 profile = load_profile(csv_path, bearing_field, z_field)
-                self._log_write(f"Loaded {len(profile)} points.")
-                self._log_write(
+                self._log_write_safe(f"Loaded {len(profile)} points.")
+                self._log_write_safe(
                     f"Search from ({start_lat:.6f}, {start_lon:.6f}), "
                     f"radius={search_radius} m, step={step_m} m, coarse={coarse_grid} m..."
                 )
@@ -322,6 +323,7 @@ class App(tk.Tk):
                     smooth_window=smooth_window,
                     progress_cb=lambda v: self.after(0, self._progress_set, v),
                     stop_event=self._stop_event,
+                    log_cb=self._log_write_safe,
                 )
 
                 if self._stop_event.is_set():
