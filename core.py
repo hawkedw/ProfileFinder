@@ -4,6 +4,7 @@ core.py — Profile matching logic for ProfileFinder.
 
 import math
 import csv
+import threading
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 
@@ -41,17 +42,14 @@ def load_profile(path: str, bearing_field: str = "Bearing", z_field: str = "Z_DS
         except csv.Error:
             dialect = csv.excel
         reader = csv.DictReader(f, dialect=dialect)
-        # Strip whitespace from column names
         reader.fieldnames = [h.strip() for h in (reader.fieldnames or [])]
         points = []
         for row in reader:
             row = {k.strip(): v.strip() for k, v in row.items()}
             if bearing_field not in row:
-                available = list(row.keys())
-                raise KeyError(f"Column '{bearing_field}' not found. Available: {available}")
+                raise KeyError(f"Column '{bearing_field}' not found. Available: {list(row.keys())}")
             if z_field not in row:
-                available = list(row.keys())
-                raise KeyError(f"Column '{z_field}' not found. Available: {available}")
+                raise KeyError(f"Column '{z_field}' not found. Available: {list(row.keys())}")
             b = float(row[bearing_field])
             z = float(row[z_field])
             points.append(ProfilePoint(bearing=b, z_dsm=z))
@@ -132,7 +130,8 @@ def _evaluate(src, ref_z, bearings, start_lon, start_lat, step_m, band, smooth_w
 
 
 def coarse_search(src, profile, start_lon, start_lat, search_radius_m,
-                  grid_step_m, step_m, band, smooth_w, top_k, progress_cb=None):
+                  grid_step_m, step_m, band, smooth_w, top_k,
+                  progress_cb=None, stop_event: Optional[threading.Event] = None):
     ref_z = np.array([p.z_dsm for p in profile], dtype=np.float64)
     if smooth_w > 1:
         ref_z = smooth(ref_z, smooth_w)
@@ -151,7 +150,11 @@ def coarse_search(src, profile, start_lon, start_lat, search_radius_m,
     candidates = []
 
     for lat in lat_steps:
+        if stop_event and stop_event.is_set():
+            break
         for lon in lon_steps:
+            if stop_event and stop_event.is_set():
+                break
             s, lons, lats = _evaluate(src, ref_z, bearings, lon, lat, step_m, band, smooth_w)
             rmse, mae, corr, matched = compute_metrics(ref_z, sample_dsm(src, lons, lats, band))
             candidates.append((s, SearchResult(
@@ -169,7 +172,8 @@ def coarse_search(src, profile, start_lon, start_lat, search_radius_m,
 
 def refine_search(src, profile, seed, step_m, band, smooth_w,
                   iterations, xy_radius_m, xy_step_m,
-                  progress_cb=None, progress_base=0.7, progress_range=0.3):
+                  progress_cb=None, progress_base=0.7, progress_range=0.3,
+                  stop_event: Optional[threading.Event] = None):
     ref_z = np.array([p.z_dsm for p in profile], dtype=np.float64)
     if smooth_w > 1:
         ref_z = smooth(ref_z, smooth_w)
@@ -179,13 +183,19 @@ def refine_search(src, profile, seed, step_m, band, smooth_w,
     best_score = score(best.rmse, best.corr, best.mae)
 
     for it in range(iterations):
+        if stop_event and stop_event.is_set():
+            break
         improved = False
         deg_step = xy_step_m / 111_320.0
         deg_radius = xy_radius_m / 111_320.0
         offsets = np.arange(-deg_radius, deg_radius + deg_step / 2, deg_step)
 
         for dlat in offsets:
+            if stop_event and stop_event.is_set():
+                break
             for dlon in offsets:
+                if stop_event and stop_event.is_set():
+                    break
                 lon = best.start_lon + dlon
                 lat = best.start_lat + dlat
                 s, lons, lats = _evaluate(src, ref_z, bearings, lon, lat, step_m, band, smooth_w)
@@ -214,7 +224,8 @@ def refine_search(src, profile, seed, step_m, band, smooth_w,
 def run_search(dsm_path, profile, start_lon, start_lat, search_radius_m,
                step_m, coarse_grid_m=60.0, smooth_window=5, top_k=10,
                refine_iterations=4, refine_xy_radius_m=120.0, refine_xy_step_m=20.0,
-               band=1, progress_cb=None):
+               band=1, progress_cb=None,
+               stop_event: Optional[threading.Event] = None):
     with rasterio.open(dsm_path) as src:
         seeds = coarse_search(
             src=src, profile=profile,
@@ -224,12 +235,15 @@ def run_search(dsm_path, profile, start_lon, start_lat, search_radius_m,
             step_m=step_m, band=band,
             smooth_w=smooth_window, top_k=top_k,
             progress_cb=progress_cb,
+            stop_event=stop_event,
         )
         if not seeds:
             raise RuntimeError("No valid candidates found in search area.")
 
         best = None
         for i, seed in enumerate(seeds):
+            if stop_event and stop_event.is_set():
+                break
             refined = refine_search(
                 src=src, profile=profile, seed=seed,
                 step_m=step_m, band=band, smooth_w=smooth_window,
@@ -239,6 +253,7 @@ def run_search(dsm_path, profile, start_lon, start_lat, search_radius_m,
                 progress_cb=progress_cb,
                 progress_base=0.7 + 0.3 * i / len(seeds),
                 progress_range=0.3 / len(seeds),
+                stop_event=stop_event,
             )
             if best is None or score(refined.rmse, refined.corr, refined.mae) < score(best.rmse, best.corr, best.mae):
                 best = refined
