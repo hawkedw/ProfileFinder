@@ -21,8 +21,8 @@ DEFAULT_PARAMS = {
     "start_lat": "0.0",
     "search_radius": "5000",
     "step_m": "5",
-    "coarse_grid": "60",
-    "smooth_window": "5",
+    "coarse_grid": "25",
+    "smooth_window": "1",
     "bearing_field": "Bearing",
     "z_field": "Z_DSM",
 }
@@ -37,29 +37,43 @@ def _browse_file(var: tk.StringVar, filetypes):
 def write_result_csv(path: str, result: SearchResult):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Id", "Lon", "Lat", "Z_DSM", "Bearing", "Z_sampled"])
-        for i, (lon, lat) in enumerate(result.points):
-            profile_pt = result.profile[i] if result.profile else None
-            z_dsm = round(profile_pt.z_dsm, 4) if profile_pt else ""
-            bearing = round(profile_pt.bearing, 4) if profile_pt else ""
-            z_samp = round(result.z_sampled[i], 4) if result.z_sampled else ""
-            w.writerow([i + 1, round(lon, 8), round(lat, 8), z_dsm, bearing, z_samp])
+        w.writerow(["Id", "Lon", "Lat", "Z_DSM", "Bearing", "Z_sampled", "dZ"])
+        count = min(len(result.points), len(result.profile), len(result.z_sampled))
+        for i in range(count):
+            lon, lat = result.points[i]
+            profile_pt = result.profile[i]
+            z_samp = result.z_sampled[i]
+            z_dsm = profile_pt.z_dsm
+            dz = (z_samp - z_dsm) if (z_samp is not None and z_dsm is not None) else None
+            w.writerow([
+                i + 1,
+                round(lon, 8),
+                round(lat, 8),
+                round(z_dsm, 4),
+                round(profile_pt.bearing, 4),
+                "" if z_samp is None or not isinstance(z_samp, (int, float)) or z_samp != z_samp else round(z_samp, 4),
+                "" if dz is None or dz != dz else round(dz, 4),
+            ])
 
 
 def write_result_geojson(path: str, result: SearchResult):
+    count = min(len(result.points), len(result.profile), len(result.z_sampled))
     features = []
-    for i, (lon, lat) in enumerate(result.points):
-        profile_pt = result.profile[i] if result.profile else None
-        z_samp = round(result.z_sampled[i], 4) if result.z_sampled else None
+
+    for i in range(count):
+        lon, lat = result.points[i]
+        profile_pt = result.profile[i]
+        z_samp = result.z_sampled[i]
+        z_dsm = profile_pt.z_dsm
+        dz = (z_samp - z_dsm) if (z_samp is not None and z_dsm is not None) else None
         props = {
             "Id": i + 1,
             "Lon": round(lon, 8),
             "Lat": round(lat, 8),
-            "Z_DSM": round(profile_pt.z_dsm, 4) if profile_pt else None,
-            "Bearing": round(profile_pt.bearing, 4) if profile_pt else None,
-            "Z_sampled": z_samp,
-            "dZ": round(z_samp - profile_pt.z_dsm, 4)
-                  if (z_samp is not None and profile_pt) else None,
+            "Z_DSM": round(z_dsm, 4),
+            "Bearing": round(profile_pt.bearing, 4),
+            "Z_sampled": None if z_samp is None or (isinstance(z_samp, float) and z_samp != z_samp) else round(z_samp, 4),
+            "dZ": None if dz is None or (isinstance(dz, float) and dz != dz) else round(dz, 4),
         }
         features.append({
             "type": "Feature",
@@ -70,7 +84,7 @@ def write_result_geojson(path: str, result: SearchResult):
             }
         })
 
-    if len(result.points) >= 2:
+    if count >= 2:
         features.append({
             "type": "Feature",
             "properties": {
@@ -79,11 +93,13 @@ def write_result_geojson(path: str, result: SearchResult):
                 "MAE": round(result.mae, 4),
                 "Pearson": round(result.corr, 4),
                 "Matched": result.matched,
+                "Bearing": round(result.bearing, 4),
+                "PerpOffset_m": round(result.perp_offset_m, 3),
+                "AlongShiftPts": result.best_shift_points,
             },
             "geometry": {
                 "type": "LineString",
-                "coordinates": [[round(lon, 8), round(lat, 8)]
-                                 for lon, lat in result.points]
+                "coordinates": [[round(result.points[i][0], 8), round(result.points[i][1], 8)] for i in range(count)]
             }
         })
 
@@ -137,21 +153,20 @@ class App(tk.Tk):
 
         ttk.Label(frame_files, text="Profile CSV:").grid(row=1, column=0, sticky="w", **pad)
         ttk.Entry(frame_files, textvariable=self._csv_var, width=48).grid(row=1, column=1, **pad)
-        ttk.Button(frame_files, text="Browse",
-                   command=self._browse_csv).grid(row=1, column=2, **pad)
+        ttk.Button(frame_files, text="Browse", command=self._browse_csv).grid(row=1, column=2, **pad)
 
         frame_params = ttk.LabelFrame(self, text="Parameters")
         frame_params.grid(row=1, column=0, sticky="ew", **pad)
 
         params = [
-            ("Start Longitude (°):", "start_lon",     "0.0"),
-            ("Start Latitude (°):",  "start_lat",     "0.0"),
-            ("Search radius (m):",   "search_radius", "5000"),
-            ("Point step (m):",      "step_m",        "5"),
-            ("Coarse grid (m):",     "coarse_grid",   "60"),
-            ("Smooth window:",       "smooth_window", "5"),
-            ("CSV Bearing field:",   "bearing_field", "Bearing"),
-            ("CSV Z_DSM field:",     "z_field",       "Z_DSM"),
+            ("Start Longitude (°):", "start_lon", "0.0"),
+            ("Start Latitude (°):", "start_lat", "0.0"),
+            ("Search radius (m):", "search_radius", "5000"),
+            ("Point step (m):", "step_m", "5"),
+            ("Perp step (m):", "coarse_grid", "25"),
+            ("Smooth window:", "smooth_window", "1"),
+            ("CSV Bearing field:", "bearing_field", "Bearing"),
+            ("CSV Z_DSM field:", "z_field", "Z_DSM"),
         ]
         self._param_vars = {}
         for i, (label, key, default) in enumerate(params):
@@ -166,16 +181,13 @@ class App(tk.Tk):
         self._btn_run = ttk.Button(frame_run, text="▶  Run", command=self._on_run)
         self._btn_run.grid(row=0, column=0, padx=4)
 
-        self._btn_stop = ttk.Button(frame_run, text="■  Stop", state="disabled",
-                                    command=self._on_stop)
+        self._btn_stop = ttk.Button(frame_run, text="■  Stop", state="disabled", command=self._on_stop)
         self._btn_stop.grid(row=0, column=1, padx=4)
 
-        self._btn_csv = ttk.Button(frame_run, text="Save CSV", state="disabled",
-                                   command=self._save_csv)
+        self._btn_csv = ttk.Button(frame_run, text="Save CSV", state="disabled", command=self._save_csv)
         self._btn_csv.grid(row=0, column=2, padx=4)
 
-        self._btn_geojson = ttk.Button(frame_run, text="Save GeoJSON", state="disabled",
-                                       command=self._save_geojson)
+        self._btn_geojson = ttk.Button(frame_run, text="Save GeoJSON", state="disabled", command=self._save_geojson)
         self._btn_geojson.grid(row=0, column=3, padx=4)
 
         self._progress = ttk.Progressbar(self, length=540, mode="determinate")
@@ -184,16 +196,11 @@ class App(tk.Tk):
         frame_log = ttk.LabelFrame(self, text="Log")
         frame_log.grid(row=4, column=0, sticky="nsew", **pad)
 
-        self._log = tk.Text(frame_log, height=14, width=72, state="disabled",
-                            font=("Consolas", 9))
+        self._log = tk.Text(frame_log, height=14, width=90, state="disabled", font=("Consolas", 9))
         self._log.grid(row=0, column=0)
         scrollbar = ttk.Scrollbar(frame_log, command=self._log.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self._log.configure(yscrollcommand=scrollbar.set)
-
-    # ------------------------------------------------------------------
-    # Settings
-    # ------------------------------------------------------------------
 
     def _load_settings(self):
         if not os.path.exists(SETTINGS_FILE):
@@ -223,10 +230,6 @@ class App(tk.Tk):
         self._save_settings()
         self.destroy()
 
-    # ------------------------------------------------------------------
-    # Browse CSV
-    # ------------------------------------------------------------------
-
     def _browse_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
         if not path:
@@ -242,10 +245,6 @@ class App(tk.Tk):
             if z_candidates:
                 self._param_vars["z_field"].set(z_candidates[0].strip())
 
-    # ------------------------------------------------------------------
-    # Logging — both direct (main thread) and thread-safe variant
-    # ------------------------------------------------------------------
-
     def _log_write(self, msg: str):
         self._log.configure(state="normal")
         self._log.insert("end", msg + "\n")
@@ -253,16 +252,11 @@ class App(tk.Tk):
         self._log.configure(state="disabled")
 
     def _log_write_safe(self, msg: str):
-        """Thread-safe: schedule log write on the main thread."""
         self.after(0, self._log_write, msg)
 
     def _progress_set(self, value: float):
         self._progress["value"] = value * 100
         self.update_idletasks()
-
-    # ------------------------------------------------------------------
-    # Run / Stop
-    # ------------------------------------------------------------------
 
     def _on_run(self):
         dsm = self._dsm_var.get().strip()
@@ -308,8 +302,8 @@ class App(tk.Tk):
                 profile = load_profile(csv_path, bearing_field, z_field)
                 self._log_write_safe(f"Loaded {len(profile)} points.")
                 self._log_write_safe(
-                    f"Search from ({start_lat:.6f}, {start_lon:.6f}), "
-                    f"radius={search_radius} m, step={step_m} m, coarse={coarse_grid} m..."
+                    f"Search from ({start_lat:.6f}, {start_lon:.6f}), radius={search_radius} m, "
+                    f"step={step_m} m, perp_step={coarse_grid} m..."
                 )
 
                 result = run_search(
@@ -351,14 +345,17 @@ class App(tk.Tk):
 
     def _on_done(self, result: SearchResult):
         self._progress["value"] = 100
-        self._log_write("─" * 50)
+        self._log_write("-" * 60)
         self._log_write("RESULT:")
-        self._log_write(f"  Start:   Lon={result.start_lon:.8f}  Lat={result.start_lat:.8f}")
-        self._log_write(f"  RMSE:    {result.rmse:.4f} m")
-        self._log_write(f"  MAE:     {result.mae:.4f} m")
-        self._log_write(f"  Pearson: {result.corr:.4f}")
-        self._log_write(f"  Matched: {result.matched} / {len(result.points)} points")
-        self._log_write("─" * 50)
+        self._log_write(f"  Start:         Lon={result.start_lon:.8f}  Lat={result.start_lat:.8f}")
+        self._log_write(f"  Bearing:       {result.bearing:.4f}")
+        self._log_write(f"  Perp offset:   {result.perp_offset_m:.3f} m")
+        self._log_write(f"  Along shift:   {result.best_shift_points} pts")
+        self._log_write(f"  RMSE:          {result.rmse:.4f} m")
+        self._log_write(f"  MAE:           {result.mae:.4f} m")
+        self._log_write(f"  Pearson:       {result.corr:.4f}")
+        self._log_write(f"  Matched:       {result.matched} / {len(result.points)} points")
+        self._log_write("-" * 60)
         self._btn_run.configure(state="normal")
         self._btn_stop.configure(state="disabled")
         self._btn_csv.configure(state="normal")
@@ -371,10 +368,6 @@ class App(tk.Tk):
         last_line = [l for l in tb.strip().splitlines() if l.strip()][-1]
         messagebox.showerror("Error", last_line)
 
-    # ------------------------------------------------------------------
-    # Save outputs
-    # ------------------------------------------------------------------
-
     def _save_csv(self):
         if not self._result:
             return
@@ -384,8 +377,13 @@ class App(tk.Tk):
             initialfile="recovered_points.csv"
         )
         if path:
-            write_result_csv(path, self._result)
-            self._log_write(f"Saved CSV: {path}")
+            try:
+                write_result_csv(path, self._result)
+                self._log_write(f"Saved CSV: {path}")
+            except Exception:
+                tb = traceback.format_exc()
+                self._log_write("SAVE CSV ERROR:\n" + tb)
+                messagebox.showerror("Save CSV error", tb.splitlines()[-1])
 
     def _save_geojson(self):
         if not self._result:
@@ -396,8 +394,13 @@ class App(tk.Tk):
             initialfile="recovered_points.geojson"
         )
         if path:
-            write_result_geojson(path, self._result)
-            self._log_write(f"Saved GeoJSON: {path}")
+            try:
+                write_result_geojson(path, self._result)
+                self._log_write(f"Saved GeoJSON: {path}")
+            except Exception:
+                tb = traceback.format_exc()
+                self._log_write("SAVE GEOJSON ERROR:\n" + tb)
+                messagebox.showerror("Save GeoJSON error", tb.splitlines()[-1])
 
 
 if __name__ == "__main__":
