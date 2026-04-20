@@ -3,7 +3,7 @@ echo === ProfileFinder build ===
 
 pip install -r requirements.txt
 
-pyinstaller --onefile --windowed --name ProfileFinder app.py
+python -m PyInstaller --onefile --windowed --name ProfileFinder ^\n  --collect-all rasterio ^\n  --collect-all pyproj ^\n  --collect-all numpy ^\n  app.py
 
 echo.
 echo Done. Executable: dist\ProfileFinder.exe
