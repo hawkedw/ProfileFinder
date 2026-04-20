@@ -1,12 +1,5 @@
 """
 core.py — Profile matching logic for ProfileFinder.
-
-Algorithm:
-1. Build a candidate chain of N points starting from (start_lon, start_lat),
-   walking step_m meters in direction Bearing[i] at each step (WGS84 geodesic).
-2. Sample DSM raster values at each point's coordinates.
-3. Compare sampled profile with reference Z_DSM column using RMSE + MAE + Pearson r.
-4. Perform coarse grid search around start point, then local refinement.
 """
 
 import math
@@ -21,14 +14,10 @@ from pyproj import Geod
 _GEOD = Geod(ellps="WGS84")
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
 @dataclass
 class ProfilePoint:
-    bearing: float   # azimuth from previous point, degrees
-    z_dsm: float     # reference DSM value
+    bearing: float
+    z_dsm: float
 
 
 @dataclass
@@ -40,18 +29,29 @@ class SearchResult:
     mae: float
     corr: float
     matched: int
-    points: List[Tuple[float, float]] = field(default_factory=list)  # (lon, lat)
+    points: List[Tuple[float, float]] = field(default_factory=list)
 
-
-# ---------------------------------------------------------------------------
-# CSV loading
-# ---------------------------------------------------------------------------
 
 def load_profile(path: str, bearing_field: str = "Bearing", z_field: str = "Z_DSM") -> List[ProfilePoint]:
-    points = []
     with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
+        sample = f.read(4096)
+        f.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.DictReader(f, dialect=dialect)
+        # Strip whitespace from column names
+        reader.fieldnames = [h.strip() for h in (reader.fieldnames or [])]
+        points = []
         for row in reader:
+            row = {k.strip(): v.strip() for k, v in row.items()}
+            if bearing_field not in row:
+                available = list(row.keys())
+                raise KeyError(f"Column '{bearing_field}' not found. Available: {available}")
+            if z_field not in row:
+                available = list(row.keys())
+                raise KeyError(f"Column '{z_field}' not found. Available: {available}")
             b = float(row[bearing_field])
             z = float(row[z_field])
             points.append(ProfilePoint(bearing=b, z_dsm=z))
@@ -60,13 +60,8 @@ def load_profile(path: str, bearing_field: str = "Bearing", z_field: str = "Z_DS
     return points
 
 
-# ---------------------------------------------------------------------------
-# Geometry helpers
-# ---------------------------------------------------------------------------
-
 def build_chain(start_lon: float, start_lat: float,
                 bearings: np.ndarray, step_m: float) -> Tuple[np.ndarray, np.ndarray]:
-    """Walk a geodesic chain. Returns (lons, lats) arrays of length len(bearings)."""
     n = len(bearings)
     lons = np.empty(n, dtype=np.float64)
     lats = np.empty(n, dtype=np.float64)
@@ -78,10 +73,6 @@ def build_chain(start_lon: float, start_lat: float,
         lon, lat = end_lon, end_lat
     return lons, lats
 
-
-# ---------------------------------------------------------------------------
-# Raster sampling
-# ---------------------------------------------------------------------------
 
 def sample_dsm(src: rasterio.DatasetReader,
                lons: np.ndarray, lats: np.ndarray,
@@ -97,10 +88,6 @@ def sample_dsm(src: rasterio.DatasetReader,
     sampled[~np.isfinite(sampled)] = np.nan
     return sampled
 
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
 
 def compute_metrics(ref: np.ndarray, sampled: np.ndarray) -> Tuple[float, float, float, int]:
     mask = np.isfinite(ref) & np.isfinite(sampled)
@@ -126,10 +113,6 @@ def score(rmse: float, corr: float, mae: float) -> float:
     return rmse * (1.0 + penalty) + 0.1 * mae
 
 
-# ---------------------------------------------------------------------------
-# Moving average smoother
-# ---------------------------------------------------------------------------
-
 def smooth(arr: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
         return arr.copy()
@@ -139,13 +122,7 @@ def smooth(arr: np.ndarray, window: int) -> np.ndarray:
     return np.convolve(padded, kernel, mode="valid")[: len(arr)]
 
 
-# ---------------------------------------------------------------------------
-# Search
-# ---------------------------------------------------------------------------
-
-def _evaluate(src, ref_z: np.ndarray, bearings: np.ndarray,
-              start_lon: float, start_lat: float, step_m: float,
-              band: int, smooth_w: int) -> Tuple[float, np.ndarray, np.ndarray]:
+def _evaluate(src, ref_z, bearings, start_lon, start_lat, step_m, band, smooth_w):
     lons, lats = build_chain(start_lon, start_lat, bearings, step_m)
     sampled = sample_dsm(src, lons, lats, band)
     if smooth_w > 1:
@@ -154,28 +131,14 @@ def _evaluate(src, ref_z: np.ndarray, bearings: np.ndarray,
     return s, lons, lats
 
 
-def coarse_search(
-    src: rasterio.DatasetReader,
-    profile: List[ProfilePoint],
-    start_lon: float,
-    start_lat: float,
-    search_radius_m: float,
-    grid_step_m: float,
-    step_m: float,
-    band: int,
-    smooth_w: int,
-    top_k: int,
-    progress_cb=None,
-) -> List[SearchResult]:
+def coarse_search(src, profile, start_lon, start_lat, search_radius_m,
+                  grid_step_m, step_m, band, smooth_w, top_k, progress_cb=None):
     ref_z = np.array([p.z_dsm for p in profile], dtype=np.float64)
     if smooth_w > 1:
         ref_z = smooth(ref_z, smooth_w)
     bearings = np.array([p.bearing for p in profile], dtype=np.float64)
 
-    # Convert search radius to degrees (rough approximation for grid)
     deg_step = grid_step_m / 111_320.0
-
-    candidates = []
     lat_steps = np.arange(start_lat - search_radius_m / 111_320.0,
                           start_lat + search_radius_m / 111_320.0 + deg_step / 2,
                           deg_step)
@@ -185,19 +148,15 @@ def coarse_search(
 
     total = len(lat_steps) * len(lon_steps)
     done = 0
+    candidates = []
 
     for lat in lat_steps:
         for lon in lon_steps:
             s, lons, lats = _evaluate(src, ref_z, bearings, lon, lat, step_m, band, smooth_w)
             rmse, mae, corr, matched = compute_metrics(ref_z, sample_dsm(src, lons, lats, band))
             candidates.append((s, SearchResult(
-                start_lon=float(lon),
-                start_lat=float(lat),
-                step_m=step_m,
-                rmse=rmse,
-                mae=mae,
-                corr=corr,
-                matched=matched,
+                start_lon=float(lon), start_lat=float(lat), step_m=step_m,
+                rmse=rmse, mae=mae, corr=corr, matched=matched,
                 points=list(zip(lons.tolist(), lats.tolist()))
             )))
             done += 1
@@ -208,20 +167,9 @@ def coarse_search(
     return [c[1] for c in candidates[:top_k]]
 
 
-def refine_search(
-    src: rasterio.DatasetReader,
-    profile: List[ProfilePoint],
-    seed: SearchResult,
-    step_m: float,
-    band: int,
-    smooth_w: int,
-    iterations: int,
-    xy_radius_m: float,
-    xy_step_m: float,
-    progress_cb=None,
-    progress_base: float = 0.7,
-    progress_range: float = 0.3,
-) -> SearchResult:
+def refine_search(src, profile, seed, step_m, band, smooth_w,
+                  iterations, xy_radius_m, xy_step_m,
+                  progress_cb=None, progress_base=0.7, progress_range=0.3):
     ref_z = np.array([p.z_dsm for p in profile], dtype=np.float64)
     if smooth_w > 1:
         ref_z = smooth(ref_z, smooth_w)
@@ -263,34 +211,18 @@ def refine_search(
     return best
 
 
-def run_search(
-    dsm_path: str,
-    profile: List[ProfilePoint],
-    start_lon: float,
-    start_lat: float,
-    search_radius_m: float,
-    step_m: float,
-    coarse_grid_m: float = 60.0,
-    smooth_window: int = 5,
-    top_k: int = 10,
-    refine_iterations: int = 4,
-    refine_xy_radius_m: float = 120.0,
-    refine_xy_step_m: float = 20.0,
-    band: int = 1,
-    progress_cb=None,
-) -> SearchResult:
+def run_search(dsm_path, profile, start_lon, start_lat, search_radius_m,
+               step_m, coarse_grid_m=60.0, smooth_window=5, top_k=10,
+               refine_iterations=4, refine_xy_radius_m=120.0, refine_xy_step_m=20.0,
+               band=1, progress_cb=None):
     with rasterio.open(dsm_path) as src:
         seeds = coarse_search(
-            src=src,
-            profile=profile,
-            start_lon=start_lon,
-            start_lat=start_lat,
+            src=src, profile=profile,
+            start_lon=start_lon, start_lat=start_lat,
             search_radius_m=search_radius_m,
             grid_step_m=coarse_grid_m,
-            step_m=step_m,
-            band=band,
-            smooth_w=smooth_window,
-            top_k=top_k,
+            step_m=step_m, band=band,
+            smooth_w=smooth_window, top_k=top_k,
             progress_cb=progress_cb,
         )
         if not seeds:
@@ -299,12 +231,8 @@ def run_search(
         best = None
         for i, seed in enumerate(seeds):
             refined = refine_search(
-                src=src,
-                profile=profile,
-                seed=seed,
-                step_m=step_m,
-                band=band,
-                smooth_w=smooth_window,
+                src=src, profile=profile, seed=seed,
+                step_m=step_m, band=band, smooth_w=smooth_window,
                 iterations=refine_iterations,
                 xy_radius_m=refine_xy_radius_m,
                 xy_step_m=refine_xy_step_m,
