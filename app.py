@@ -1,41 +1,20 @@
 """
 app.py — ProfileFinder GUI (tkinter)
-
-Layout:
-  [DSM path]         [Browse]
-  [CSV path]         [Browse]
-  Start Lon/Lat      [fields]
-  Search radius (m)  [field]
-  Point step (m)     [field]
-  Coarse grid (m)    [field]
-  Smooth window      [field]
-  [Run]  [Save CSV]  [Save GeoJSON]
-  Progress bar
-  Log / results panel
 """
 
 import csv
 import json
 import os
 import threading
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from core import load_profile, run_search, SearchResult
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _browse_file(var: tk.StringVar, filetypes):
     path = filedialog.askopenfilename(filetypes=filetypes)
-    if path:
-        var.set(path)
-
-
-def _save_file(var: tk.StringVar, filetypes, default_ext):
-    path = filedialog.asksaveasfilename(filetypes=filetypes, defaultextension=default_ext)
     if path:
         var.set(path)
 
@@ -61,9 +40,15 @@ def write_result_geojson(path: str, result: SearchResult):
         json.dump(fc, f, ensure_ascii=False)
 
 
-# ---------------------------------------------------------------------------
-# Main window
-# ---------------------------------------------------------------------------
+def read_csv_columns(path: str) -> list:
+    """Return list of column names from CSV header."""
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        try:
+            return next(reader)
+        except StopIteration:
+            return []
+
 
 class App(tk.Tk):
     def __init__(self):
@@ -73,14 +58,9 @@ class App(tk.Tk):
         self._result: SearchResult | None = None
         self._build_ui()
 
-    # ------------------------------------------------------------------
-    # UI construction
-    # ------------------------------------------------------------------
-
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
 
-        # ── File inputs ────────────────────────────────────────────────
         frame_files = ttk.LabelFrame(self, text="Inputs")
         frame_files.grid(row=0, column=0, sticky="ew", **pad)
 
@@ -97,11 +77,9 @@ class App(tk.Tk):
         ttk.Label(frame_files, text="Profile CSV:").grid(row=1, column=0, sticky="w", **pad)
         ttk.Entry(frame_files, textvariable=self._csv_var, width=48).grid(row=1, column=1, **pad)
         ttk.Button(frame_files, text="Browse",
-                   command=lambda: _browse_file(self._csv_var,
-                                                [("CSV", "*.csv"), ("All", "*.*")])
+                   command=lambda: self._browse_csv()
                    ).grid(row=1, column=2, **pad)
 
-        # ── Parameters ────────────────────────────────────────────────
         frame_params = ttk.LabelFrame(self, text="Parameters")
         frame_params.grid(row=1, column=0, sticky="ew", **pad)
 
@@ -122,7 +100,6 @@ class App(tk.Tk):
             ttk.Entry(frame_params, textvariable=var, width=20).grid(row=i, column=1, sticky="w", **pad)
             self._param_vars[key] = var
 
-        # ── Run button ────────────────────────────────────────────────
         frame_run = ttk.Frame(self)
         frame_run.grid(row=2, column=0, **pad)
 
@@ -137,24 +114,34 @@ class App(tk.Tk):
                                        command=self._save_geojson)
         self._btn_geojson.grid(row=0, column=2, padx=4)
 
-        # ── Progress ──────────────────────────────────────────────────
         self._progress = ttk.Progressbar(self, length=540, mode="determinate")
         self._progress.grid(row=3, column=0, **pad)
 
-        # ── Log ───────────────────────────────────────────────────────
         frame_log = ttk.LabelFrame(self, text="Log")
         frame_log.grid(row=4, column=0, sticky="nsew", **pad)
 
-        self._log = tk.Text(frame_log, height=12, width=70, state="disabled",
+        self._log = tk.Text(frame_log, height=14, width=72, state="disabled",
                             font=("Consolas", 9))
         self._log.grid(row=0, column=0)
         scrollbar = ttk.Scrollbar(frame_log, command=self._log.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self._log.configure(yscrollcommand=scrollbar.set)
 
-    # ------------------------------------------------------------------
-    # Logging
-    # ------------------------------------------------------------------
+    def _browse_csv(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not path:
+            return
+        self._csv_var.set(path)
+        cols = read_csv_columns(path)
+        if cols:
+            self._log_write(f"CSV columns detected: {cols}")
+            # Auto-fill field names if exact match found
+            bearing_candidates = [c for c in cols if c.strip().lower() == "bearing"]
+            z_candidates = [c for c in cols if c.strip().lower() == "z_dsm"]
+            if bearing_candidates:
+                self._param_vars["bearing_field"].set(bearing_candidates[0].strip())
+            if z_candidates:
+                self._param_vars["z_field"].set(z_candidates[0].strip())
 
     def _log_write(self, msg: str):
         self._log.configure(state="normal")
@@ -165,10 +152,6 @@ class App(tk.Tk):
     def _progress_set(self, value: float):
         self._progress["value"] = value * 100
         self.update_idletasks()
-
-    # ------------------------------------------------------------------
-    # Run
-    # ------------------------------------------------------------------
 
     def _on_run(self):
         dsm = self._dsm_var.get().strip()
@@ -204,11 +187,17 @@ class App(tk.Tk):
 
         def worker():
             try:
-                self._log_write("Loading profile CSV...")
+                # Show actual CSV columns before loading
+                cols = read_csv_columns(csv_path)
+                self._log_write(f"CSV columns: {cols}")
+                self._log_write(f"Using bearing field: '{bearing_field}', z field: '{z_field}'")
+
                 profile = load_profile(csv_path, bearing_field, z_field)
-                self._log_write(f"  {len(profile)} points loaded.")
-                self._log_write(f"Starting search from ({start_lat:.6f}, {start_lon:.6f}), "
-                                f"radius={search_radius} m, step={step_m} m...")
+                self._log_write(f"Loaded {len(profile)} points.")
+                self._log_write(
+                    f"Search from ({start_lat:.6f}, {start_lon:.6f}), "
+                    f"radius={search_radius} m, step={step_m} m, coarse={coarse_grid} m..."
+                )
 
                 result = run_search(
                     dsm_path=dsm,
@@ -225,15 +214,16 @@ class App(tk.Tk):
                 self._result = result
                 self.after(0, self._on_done, result)
 
-            except Exception as e:
-                self.after(0, self._on_error, str(e))
+            except Exception:
+                tb = traceback.format_exc()
+                self.after(0, self._on_error, tb)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _on_done(self, result: SearchResult):
         self._progress["value"] = 100
         self._log_write("─" * 50)
-        self._log_write(f"RESULT:")
+        self._log_write("RESULT:")
         self._log_write(f"  Start:   Lon={result.start_lon:.8f}  Lat={result.start_lat:.8f}")
         self._log_write(f"  RMSE:    {result.rmse:.4f} m")
         self._log_write(f"  MAE:     {result.mae:.4f} m")
@@ -244,14 +234,12 @@ class App(tk.Tk):
         self._btn_csv.configure(state="normal")
         self._btn_geojson.configure(state="normal")
 
-    def _on_error(self, msg: str):
-        self._log_write(f"ERROR: {msg}")
+    def _on_error(self, tb: str):
+        self._log_write("ERROR:\n" + tb)
         self._btn_run.configure(state="normal")
-        messagebox.showerror("Error", msg)
-
-    # ------------------------------------------------------------------
-    # Save outputs
-    # ------------------------------------------------------------------
+        # Show only last line in messagebox, full trace in log
+        last_line = [l for l in tb.strip().splitlines() if l.strip()][-1]
+        messagebox.showerror("Error", last_line)
 
     def _save_csv(self):
         if not self._result:
@@ -277,10 +265,6 @@ class App(tk.Tk):
             write_result_geojson(path, self._result)
             self._log_write(f"Saved GeoJSON: {path}")
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     app = App()
