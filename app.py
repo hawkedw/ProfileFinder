@@ -37,22 +37,69 @@ def _browse_file(var: tk.StringVar, filetypes):
 def write_result_csv(path: str, result: SearchResult):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Id", "Lon", "Lat"])
-        for i, (lon, lat) in enumerate(result.points, start=1):
-            w.writerow([i, round(lon, 8), round(lat, 8)])
+        w.writerow(["Id", "Lon", "Lat", "Z_DSM", "Bearing", "Z_sampled"])
+        for i, (lon, lat) in enumerate(result.points):
+            profile_pt = result.profile[i] if result.profile else None
+            z_dsm = round(profile_pt.z_dsm, 4) if profile_pt else ""
+            bearing = round(profile_pt.bearing, 4) if profile_pt else ""
+            z_samp = round(result.z_sampled[i], 4) if result.z_sampled else ""
+            w.writerow([i + 1, round(lon, 8), round(lat, 8), z_dsm, bearing, z_samp])
 
 
 def write_result_geojson(path: str, result: SearchResult):
     features = []
-    for i, (lon, lat) in enumerate(result.points, start=1):
+
+    # Individual point features
+    for i, (lon, lat) in enumerate(result.points):
+        profile_pt = result.profile[i] if result.profile else None
+        z_samp = round(result.z_sampled[i], 4) if result.z_sampled else None
+        props = {
+            "Id": i + 1,
+            "Lon": round(lon, 8),
+            "Lat": round(lat, 8),
+            "Z_DSM": round(profile_pt.z_dsm, 4) if profile_pt else None,
+            "Bearing": round(profile_pt.bearing, 4) if profile_pt else None,
+            "Z_sampled": z_samp,
+            "dZ": round(z_samp - profile_pt.z_dsm, 4)
+                  if (z_samp is not None and profile_pt) else None,
+        }
         features.append({
             "type": "Feature",
-            "properties": {"Id": i},
-            "geometry": {"type": "Point", "coordinates": [round(lon, 8), round(lat, 8)]}
+            "properties": props,
+            "geometry": {
+                "type": "Point",
+                "coordinates": [round(lon, 8), round(lat, 8)]
+            }
         })
-    fc = {"type": "FeatureCollection", "features": features}
+
+    # LineString connecting all points in order
+    if len(result.points) >= 2:
+        features.append({
+            "type": "Feature",
+            "properties": {
+                "type": "recovered_line",
+                "RMSE": round(result.rmse, 4),
+                "MAE": round(result.mae, 4),
+                "Pearson": round(result.corr, 4),
+                "Matched": result.matched,
+            },
+            "geometry": {
+                "type": "LineString",
+                "coordinates": [[round(lon, 8), round(lat, 8)]
+                                 for lon, lat in result.points]
+            }
+        })
+
+    fc = {
+        "type": "FeatureCollection",
+        "crs": {
+            "type": "name",
+            "properties": {"name": "urn:ogc:def:crs:OGC:1.3:CRS84"}
+        },
+        "features": features
+    }
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(fc, f, ensure_ascii=False)
+        json.dump(fc, f, ensure_ascii=False, indent=2)
 
 
 def read_csv_columns(path: str) -> list:
