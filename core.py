@@ -1,16 +1,11 @@
 """
-core.py — ProfileFinder: fast straight-line profile matching.
+core.py — ProfileFinder: profile matching for variable bearing/distance chains.
 
-Assumptions for current version:
-- all points lie on one straight line
-- Bearing is constant for all points (uses first valid bearing from CSV)
-- start point is approximately known
-
-Search strategy:
-1) sample DSM along candidate line extended by extra pts on both sides
-2) slide ref profile over extended sampled array (normalized cross-correlation)
-3) pick shift with best correlation → final start point
-4) refine perpendicular offset with smaller step
+Supports:
+- constant or per-row bearing values
+- constant or per-row distances
+- distance units in meters or degrees
+- approximate start point search with perpendicular offset and start-point shift
 """
 
 import csv
@@ -25,12 +20,21 @@ from pyproj import Geod
 from rasterio.transform import rowcol
 
 _GEOD = Geod(ellps="WGS84")
+_METERS_PER_DEGREE = 111320.0
 
 
 @dataclass
 class ProfilePoint:
     bearing: float
     z_dsm: float
+    distance_value: float = 0.0
+    distance_unit: str = "m"
+
+    @property
+    def distance_m(self) -> float:
+        if (self.distance_unit or "m").lower().startswith("deg"):
+            return float(self.distance_value) * _METERS_PER_DEGREE
+        return float(self.distance_value)
 
 
 @dataclass
@@ -84,31 +88,68 @@ def sample_cache(cache: DsmCache, lons: np.ndarray, lats: np.ndarray) -> np.ndar
     return out
 
 
-def load_profile(path: str, bearing_field: str = "Bearing", z_field: str = "Z_DSM") -> List[ProfilePoint]:
+def _parse_float(value, field_name: str) -> float:
+    if value is None:
+        raise ValueError(f"Field '{field_name}' has empty value.")
+    text = str(value).strip().replace(",", ".")
+    if text == "":
+        raise ValueError(f"Field '{field_name}' has empty value.")
+    return float(text)
+
+
+def load_profile(
+    path: str,
+    bearing_mode: str = "field",
+    bearing_field: str = "Bearing",
+    bearing_const: float = 0.0,
+    z_field: str = "Z_DSM",
+    distance_mode: str = "const",
+    distance_field: str = "Distance",
+    distance_const: float = 5.0,
+    distance_unit: str = "m",
+) -> List[ProfilePoint]:
     with open(path, newline="", encoding="utf-8-sig") as f:
         sample_data = f.read(8192)
         f.seek(0)
-        # Force semicolon dialect if header looks like a single field "Z_DSM;Bearing"
         try:
             dialect = csv.Sniffer().sniff(sample_data, delimiters=",;\t|")
         except csv.Error:
             dialect = csv.excel
         reader = csv.DictReader(f, dialect=dialect)
         raw_fields = reader.fieldnames or []
-        # If still one compound field, split manually
         if len(raw_fields) == 1 and ";" in raw_fields[0]:
             f.seek(0)
             reader = csv.DictReader(f, dialect=csv.excel, delimiter=";")
             raw_fields = reader.fieldnames or []
         reader.fieldnames = [h.strip() for h in raw_fields]
-        points = []
+
+        points: List[ProfilePoint] = []
         for row in reader:
             row = {(k.strip() if k else k): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
-            if bearing_field not in row:
-                raise KeyError(f"Column '{bearing_field}' not found. Available: {list(row.keys())}")
             if z_field not in row:
                 raise KeyError(f"Column '{z_field}' not found. Available: {list(row.keys())}")
-            points.append(ProfilePoint(bearing=float(row[bearing_field]), z_dsm=float(row[z_field])))
+
+            if (bearing_mode or "field") == "field":
+                if bearing_field not in row:
+                    raise KeyError(f"Column '{bearing_field}' not found. Available: {list(row.keys())}")
+                bearing = _parse_float(row[bearing_field], bearing_field)
+            else:
+                bearing = float(bearing_const)
+
+            if (distance_mode or "const") == "field":
+                if distance_field not in row:
+                    raise KeyError(f"Column '{distance_field}' not found. Available: {list(row.keys())}")
+                distance_value = _parse_float(row[distance_field], distance_field)
+            else:
+                distance_value = float(distance_const)
+
+            points.append(ProfilePoint(
+                bearing=float(bearing),
+                z_dsm=_parse_float(row[z_field], z_field),
+                distance_value=float(distance_value),
+                distance_unit=distance_unit,
+            ))
+
     if not points:
         raise ValueError("CSV is empty or fields not found.")
     return points
@@ -152,112 +193,88 @@ def shift_origin(lon: float, lat: float, azimuth_deg: float, dist_m: float) -> T
     return float(lon2), float(lat2)
 
 
-def build_straight_chain(start_lon: float, start_lat: float,
-                          bearing: float, step_m: float, count: int) -> Tuple[np.ndarray, np.ndarray]:
-    distances = np.arange(count, dtype=np.float64) * step_m
-    lons, lats, _ = _GEOD.fwd(
-        np.full(count, start_lon, dtype=np.float64),
-        np.full(count, start_lat, dtype=np.float64),
-        np.full(count, bearing, dtype=np.float64),
-        distances,
-    )
-    return np.asarray(lons, dtype=np.float64), np.asarray(lats, dtype=np.float64)
+def build_chain(start_lon: float, start_lat: float, profile: List[ProfilePoint]) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(profile)
+    lons = np.empty(n, dtype=np.float64)
+    lats = np.empty(n, dtype=np.float64)
+    lons[0] = float(start_lon)
+    lats[0] = float(start_lat)
+    for i in range(1, n):
+        prev = profile[i - 1]
+        lon2, lat2, _ = _GEOD.fwd(lons[i - 1], lats[i - 1], prev.bearing, prev.distance_m)
+        lons[i] = lon2
+        lats[i] = lat2
+    return lons, lats
 
 
-def best_along_shift(ref: np.ndarray, cand_extended: np.ndarray, extra: int) -> Tuple[int, float]:
-    """
-    Slide ref (len=N) over cand_extended (len=N+2*extra).
-    shift=0 means cand starts at index `extra` (perfect alignment).
-    Returns shift in [-extra, +extra] and best NCC value.
-    cand_extended[extra + shift : extra + shift + N] is aligned with ref.
-    """
-    n = len(ref)
-    best_shift = 0
-    best_corr = -2.0
-    for shift in range(-extra, extra + 1):
-        idx = extra + shift
-        c = cand_extended[idx: idx + n]
-        if len(c) != n:
-            continue
-        mask = np.isfinite(ref) & np.isfinite(c)
-        if mask.sum() < 10:
-            continue
-        rv = ref[mask] - ref[mask].mean()
-        cv = c[mask] - c[mask].mean()
-        denom = float(np.linalg.norm(rv) * np.linalg.norm(cv))
-        corr = float(np.dot(rv, cv) / denom) if denom > 1e-12 else -1.0
-        if corr > best_corr:
-            best_corr = corr
-            best_shift = shift
-    return best_shift, best_corr
+def shift_profile_start(profile: List[ProfilePoint], shift_pts: int) -> List[ProfilePoint]:
+    n = len(profile)
+    if n == 0 or shift_pts == 0:
+        return list(profile)
+    if shift_pts > 0:
+        if shift_pts >= n:
+            shift_pts = n - 1
+        return [profile[min(i + shift_pts, n - 1)] for i in range(n)]
+    k = abs(shift_pts)
+    if k >= n:
+        k = n - 1
+    prefix = [profile[0] for _ in range(k)]
+    return prefix + [profile[i - k] for i in range(k, n)]
 
 
-def evaluate_offset(cache: DsmCache,
-                    ref_z: np.ndarray,
-                    approx_lon: float,
-                    approx_lat: float,
-                    bearing: float,
-                    perp_offset_m: float,
-                    step_m: float,
-                    max_along_shift_pts: int,
-                    smooth_window: int) -> Tuple[float, float, float, int, int, np.ndarray, Tuple[float, float]]:
-    # Shift start perpendicularly
-    cand_start_lon, cand_start_lat = shift_origin(approx_lon, approx_lat, bearing + 90.0, perp_offset_m)
-    extra = max_along_shift_pts
-    # Extend line backward by extra steps
-    line_start_lon, line_start_lat = shift_origin(cand_start_lon, cand_start_lat, bearing, -extra * step_m)
-    total_count = len(ref_z) + 2 * extra
-    lons_full, lats_full = build_straight_chain(line_start_lon, line_start_lat, bearing, step_m, total_count)
-    sampled_full = sample_cache(cache, lons_full, lats_full)
-    if smooth_window > 1:
-        sampled_full = smooth(sampled_full, smooth_window)
+def evaluate_candidate(
+    cache: DsmCache,
+    ref_z: np.ndarray,
+    approx_lon: float,
+    approx_lat: float,
+    base_bearing: float,
+    profile: List[ProfilePoint],
+    perp_offset_m: float,
+    along_shift_pts: int,
+    smooth_window: int,
+) -> Tuple[float, float, float, float, int, np.ndarray, Tuple[float, float], np.ndarray, np.ndarray]:
+    cand_start_lon, cand_start_lat = shift_origin(approx_lon, approx_lat, base_bearing + 90.0, perp_offset_m)
 
-    shift_pts, _ = best_along_shift(ref_z, sampled_full, extra)
+    shifted_profile = shift_profile_start(profile, along_shift_pts)
+    lons, lats = build_chain(cand_start_lon, cand_start_lat, shifted_profile)
+    sampled = sample_cache(cache, lons, lats)
+    sampled_eval = smooth(sampled, smooth_window) if smooth_window > 1 else sampled.copy()
 
-    idx = extra + shift_pts
-    aligned = sampled_full[idx: idx + len(ref_z)]
-    if len(aligned) < len(ref_z):
-        aligned = np.pad(aligned, (0, len(ref_z) - len(aligned)), constant_values=np.nan)
-
-    rmse, mae, corr, matched = compute_metrics(ref_z, aligned)
+    rmse, mae, corr, matched = compute_metrics(ref_z, sampled_eval)
     s = score(rmse, corr, mae)
-
-    # Final start point = line_start shifted forward by (extra + shift_pts) steps
-    final_start_lon = float(lons_full[max(0, min(idx, total_count - 1))])
-    final_start_lat = float(lats_full[max(0, min(idx, total_count - 1))])
-    return s, rmse, mae, matched, shift_pts, aligned, (final_start_lon, final_start_lat)
+    return s, rmse, mae, corr, matched, sampled, (cand_start_lon, cand_start_lat), lons, lats
 
 
-def run_search(dsm_path: str,
-               profile: List[ProfilePoint],
-               start_lon: float,
-               start_lat: float,
-               search_radius_m: float,
-               step_m: float,
-               coarse_grid_m: float = 25.0,
-               smooth_window: int = 1,
-               top_k: int = 1,
-               refine_iterations: int = 2,
-               refine_xy_radius_m: float = 0.0,
-               refine_xy_step_m: float = 0.0,
-               band: int = 1,
-               progress_cb: Optional[Callable] = None,
-               stop_event: Optional[threading.Event] = None,
-               log_cb: Optional[Callable] = None) -> SearchResult:
+def run_search(
+    dsm_path: str,
+    profile: List[ProfilePoint],
+    start_lon: float,
+    start_lat: float,
+    search_radius_m: float,
+    step_m: float,
+    coarse_grid_m: float = 25.0,
+    smooth_window: int = 1,
+    top_k: int = 1,
+    refine_iterations: int = 2,
+    refine_xy_radius_m: float = 0.0,
+    refine_xy_step_m: float = 0.0,
+    band: int = 1,
+    progress_cb: Optional[Callable] = None,
+    stop_event: Optional[threading.Event] = None,
+    log_cb: Optional[Callable] = None,
+) -> SearchResult:
     if not profile:
         raise ValueError("Profile is empty")
 
-    bearing = float(profile[0].bearing)
-    if any(abs(p.bearing - bearing) > 1e-6 for p in profile):
-        if log_cb:
-            log_cb("Warning: bearings differ. Using bearing from first point.")
+    ref_z_raw = np.asarray([p.z_dsm for p in profile], dtype=np.float64)
+    ref_z = smooth(ref_z_raw, smooth_window) if smooth_window > 1 else ref_z_raw.copy()
 
-    ref_z = np.asarray([p.z_dsm for p in profile], dtype=np.float64)
-    ref_z_for_match = smooth(ref_z, smooth_window) if smooth_window > 1 else ref_z.copy()
-
-    max_along_shift_pts = max(1, int(round(search_radius_m / step_m)))
+    base_bearing = float(profile[0].bearing)
+    mean_step_m = float(np.mean([max(0.001, p.distance_m) for p in profile[:-1]])) if len(profile) > 1 else float(step_m)
+    max_along_shift_pts = max(1, int(round(search_radius_m / max(mean_step_m, 0.001))))
     coarse_step = max(1.0, coarse_grid_m)
     offsets = np.arange(-search_radius_m, search_radius_m + coarse_step * 0.5, coarse_step, dtype=np.float64)
+    shifts = np.arange(-max_along_shift_pts, max_along_shift_pts + 1, 1, dtype=np.int32)
 
     with rasterio.open(dsm_path) as src:
         if log_cb:
@@ -265,11 +282,14 @@ def run_search(dsm_path: str,
         cache = load_dsm_cache(src, band)
 
     if log_cb:
-        log_cb(f"Straight-line mode. Bearing={bearing:.6f}\u00b0, points={len(profile)}, step={step_m} m")
-        log_cb(f"Perpendicular search: {len(offsets)} candidates, along-line max shift: \u00b1{max_along_shift_pts} pts")
+        log_cb(
+            f"Variable-chain mode. Points={len(profile)}, base bearing={base_bearing:.6f}°, "
+            f"mean step={mean_step_m:.3f} m"
+        )
+        log_cb(f"Perpendicular search: {len(offsets)} candidates; along-start shifts: ±{max_along_shift_pts} pts")
 
     best = None
-    total = max(1, len(offsets) + refine_iterations * 10)
+    total = max(1, len(offsets) * len(shifts) + refine_iterations * 20)
     done = 0
 
     def report_progress():
@@ -279,34 +299,43 @@ def run_search(dsm_path: str,
     for perp_offset_m in offsets:
         if stop_event and stop_event.is_set():
             break
-        s, rmse, mae, matched, shift_pts, aligned, final_start = evaluate_offset(
-            cache=cache,
-            ref_z=ref_z_for_match,
-            approx_lon=start_lon,
-            approx_lat=start_lat,
-            bearing=bearing,
-            perp_offset_m=float(perp_offset_m),
-            step_m=step_m,
-            max_along_shift_pts=max_along_shift_pts,
-            smooth_window=smooth_window,
-        )
-        corr = compute_metrics(ref_z_for_match, aligned)[2]
-        current = {
-            "score": s, "rmse": rmse, "mae": mae, "corr": corr,
-            "matched": matched, "shift_pts": shift_pts,
-            "perp_offset_m": float(perp_offset_m),
-            "start_lon": final_start[0], "start_lat": final_start[1],
-        }
-        if best is None or current["score"] < best["score"]:
-            best = current
-            if log_cb:
-                log_cb(
-                    f"Best coarse: perp={best['perp_offset_m']:.1f} m, "
-                    f"shift={best['shift_pts']} pts, "
-                    f"RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
-                )
-        done += 1
-        report_progress()
+        for shift_pts in shifts:
+            if stop_event and stop_event.is_set():
+                break
+            s, rmse, mae, corr, matched, sampled_raw, final_start, lons, lats = evaluate_candidate(
+                cache=cache,
+                ref_z=ref_z,
+                approx_lon=start_lon,
+                approx_lat=start_lat,
+                base_bearing=base_bearing,
+                profile=profile,
+                perp_offset_m=float(perp_offset_m),
+                along_shift_pts=int(shift_pts),
+                smooth_window=smooth_window,
+            )
+            current = {
+                "score": s,
+                "rmse": rmse,
+                "mae": mae,
+                "corr": corr,
+                "matched": matched,
+                "shift_pts": int(shift_pts),
+                "perp_offset_m": float(perp_offset_m),
+                "start_lon": final_start[0],
+                "start_lat": final_start[1],
+                "lons": lons,
+                "lats": lats,
+                "sampled_raw": sampled_raw,
+            }
+            if best is None or current["score"] < best["score"]:
+                best = current
+                if log_cb:
+                    log_cb(
+                        f"Best coarse: perp={best['perp_offset_m']:.1f} m, shift={best['shift_pts']} pts, "
+                        f"RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
+                    )
+            done += 1
+            report_progress()
 
     if best is None:
         raise RuntimeError("No valid candidates found in search area.")
@@ -322,47 +351,57 @@ def run_search(dsm_path: str,
             refine_step,
             dtype=np.float64,
         )
+        local_shifts = np.arange(best["shift_pts"] - 2, best["shift_pts"] + 3, 1, dtype=np.int32)
         improved = False
         for perp_offset_m in local_offsets:
             if stop_event and stop_event.is_set():
                 break
-            s, rmse, mae, matched, shift_pts, aligned, final_start = evaluate_offset(
-                cache=cache,
-                ref_z=ref_z_for_match,
-                approx_lon=start_lon,
-                approx_lat=start_lat,
-                bearing=bearing,
-                perp_offset_m=float(perp_offset_m),
-                step_m=step_m,
-                max_along_shift_pts=max_along_shift_pts,
-                smooth_window=smooth_window,
-            )
-            corr = compute_metrics(ref_z_for_match, aligned)[2]
-            if s < best["score"]:
-                best = {
-                    "score": s, "rmse": rmse, "mae": mae, "corr": corr,
-                    "matched": matched, "shift_pts": shift_pts,
-                    "perp_offset_m": float(perp_offset_m),
-                    "start_lon": final_start[0], "start_lat": final_start[1],
-                }
-                improved = True
+            for shift_pts in local_shifts:
+                if stop_event and stop_event.is_set():
+                    break
+                s, rmse, mae, corr, matched, sampled_raw, final_start, lons, lats = evaluate_candidate(
+                    cache=cache,
+                    ref_z=ref_z,
+                    approx_lon=start_lon,
+                    approx_lat=start_lat,
+                    base_bearing=base_bearing,
+                    profile=profile,
+                    perp_offset_m=float(perp_offset_m),
+                    along_shift_pts=int(shift_pts),
+                    smooth_window=smooth_window,
+                )
+                if s < best["score"]:
+                    best = {
+                        "score": s,
+                        "rmse": rmse,
+                        "mae": mae,
+                        "corr": corr,
+                        "matched": matched,
+                        "shift_pts": int(shift_pts),
+                        "perp_offset_m": float(perp_offset_m),
+                        "start_lon": final_start[0],
+                        "start_lat": final_start[1],
+                        "lons": lons,
+                        "lats": lats,
+                        "sampled_raw": sampled_raw,
+                    }
+                    improved = True
         refine_radius = max(refine_step * 2, refine_radius / 2.0)
         refine_step = max(1.0, refine_step / 2.0)
         if log_cb:
             log_cb(
-                f"Refine {it + 1}: perp={best['perp_offset_m']:.2f} m, "
-                f"shift={best['shift_pts']} pts, "
+                f"Refine {it + 1}: perp={best['perp_offset_m']:.2f} m, shift={best['shift_pts']} pts, "
                 f"RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
             )
-        done += 10
+        done += 20
         report_progress()
         if not improved and refine_step <= 1.0:
             break
 
-    final_lons, final_lats = build_straight_chain(
-        best["start_lon"], best["start_lat"], bearing, step_m, len(profile))
+    final_profile = shift_profile_start(profile, int(best["shift_pts"]))
+    final_lons, final_lats = build_chain(best["start_lon"], best["start_lat"], final_profile)
     final_sampled = sample_cache(cache, final_lons, final_lats)
-    rmse, mae, corr, matched = compute_metrics(ref_z, final_sampled)
+    rmse, mae, corr, matched = compute_metrics(ref_z_raw, final_sampled)
 
     if log_cb:
         log_cb(
@@ -376,15 +415,15 @@ def run_search(dsm_path: str,
     return SearchResult(
         start_lon=float(best["start_lon"]),
         start_lat=float(best["start_lat"]),
-        step_m=float(step_m),
+        step_m=float(mean_step_m if math.isfinite(mean_step_m) else step_m),
         rmse=rmse,
         mae=mae,
         corr=corr,
         matched=matched,
         points=list(zip(final_lons.tolist(), final_lats.tolist())),
-        profile=profile,
+        profile=final_profile,
         z_sampled=final_sampled.tolist(),
         best_shift_points=int(best["shift_pts"]),
-        bearing=float(bearing),
+        bearing=float(base_bearing),
         perp_offset_m=float(best["perp_offset_m"]),
     )

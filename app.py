@@ -23,7 +23,13 @@ DEFAULT_PARAMS = {
     "step_m": "5",
     "coarse_grid": "25",
     "smooth_window": "1",
+    "bearing_mode": "field",
+    "bearing_const": "0",
     "bearing_field": "Bearing",
+    "distance_mode": "const",
+    "distance_const": "5",
+    "distance_field": "Distance",
+    "distance_unit": "m",
     "z_field": "Z_DSM",
 }
 
@@ -37,7 +43,7 @@ def _browse_file(var: tk.StringVar, filetypes):
 def write_result_csv(path: str, result: SearchResult):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Id", "Lon", "Lat", "Z_DSM", "Bearing", "Z_sampled", "dZ"])
+        w.writerow(["Id", "Lon", "Lat", "Z_DSM", "Bearing", "DistanceValue", "DistanceUnit", "Z_sampled", "dZ"])
         count = min(len(result.points), len(result.profile), len(result.z_sampled))
         for i in range(count):
             lon, lat = result.points[i]
@@ -51,6 +57,8 @@ def write_result_csv(path: str, result: SearchResult):
                 round(lat, 8),
                 round(z_dsm, 4),
                 round(profile_pt.bearing, 4),
+                round(profile_pt.distance_value, 6),
+                profile_pt.distance_unit,
                 "" if z_samp is None or not isinstance(z_samp, (int, float)) or z_samp != z_samp else round(z_samp, 4),
                 "" if dz is None or dz != dz else round(dz, 4),
             ])
@@ -72,6 +80,8 @@ def write_result_geojson(path: str, result: SearchResult):
             "Lat": round(lat, 8),
             "Z_DSM": round(z_dsm, 4),
             "Bearing": round(profile_pt.bearing, 4),
+            "DistanceValue": round(profile_pt.distance_value, 6),
+            "DistanceUnit": profile_pt.distance_unit,
             "Z_sampled": None if z_samp is None or (isinstance(z_samp, float) and z_samp != z_samp) else round(z_samp, 4),
             "dZ": None if dz is None or (isinstance(dz, float) and dz != dz) else round(dz, 4),
         }
@@ -119,7 +129,7 @@ def read_csv_columns(path: str) -> list:
     with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.reader(f)
         try:
-            return next(reader)
+            return [c.strip() for c in next(reader)]
         except StopIteration:
             return []
 
@@ -131,6 +141,7 @@ class App(tk.Tk):
         self.resizable(False, False)
         self._result: SearchResult | None = None
         self._stop_event = threading.Event()
+        self._csv_columns = []
         self._build_ui()
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -145,35 +156,82 @@ class App(tk.Tk):
         self._csv_var = tk.StringVar()
 
         ttk.Label(frame_files, text="DSM (.tif):").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(frame_files, textvariable=self._dsm_var, width=48).grid(row=0, column=1, **pad)
+        ttk.Entry(frame_files, textvariable=self._dsm_var, width=52).grid(row=0, column=1, **pad)
         ttk.Button(frame_files, text="Browse",
                    command=lambda: _browse_file(self._dsm_var,
                                                 [("GeoTIFF", "*.tif *.tiff"), ("All", "*.*")])
                    ).grid(row=0, column=2, **pad)
 
         ttk.Label(frame_files, text="Profile CSV:").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(frame_files, textvariable=self._csv_var, width=48).grid(row=1, column=1, **pad)
+        ttk.Entry(frame_files, textvariable=self._csv_var, width=52).grid(row=1, column=1, **pad)
         ttk.Button(frame_files, text="Browse", command=self._browse_csv).grid(row=1, column=2, **pad)
 
         frame_params = ttk.LabelFrame(self, text="Parameters")
         frame_params.grid(row=1, column=0, sticky="ew", **pad)
 
-        params = [
-            ("Start Longitude (°):", "start_lon", "0.0"),
-            ("Start Latitude (°):", "start_lat", "0.0"),
-            ("Search radius (m):", "search_radius", "5000"),
-            ("Point step (m):", "step_m", "5"),
-            ("Perp step (m):", "coarse_grid", "25"),
-            ("Smooth window:", "smooth_window", "1"),
-            ("CSV Bearing field:", "bearing_field", "Bearing"),
-            ("CSV Z_DSM field:", "z_field", "Z_DSM"),
-        ]
-        self._param_vars = {}
-        for i, (label, key, default) in enumerate(params):
-            ttk.Label(frame_params, text=label).grid(row=i, column=0, sticky="w", **pad)
-            var = tk.StringVar(value=default)
-            ttk.Entry(frame_params, textvariable=var, width=20).grid(row=i, column=1, sticky="w", **pad)
-            self._param_vars[key] = var
+        self._param_vars = {
+            "start_lon": tk.StringVar(value="0.0"),
+            "start_lat": tk.StringVar(value="0.0"),
+            "search_radius": tk.StringVar(value="5000"),
+            "step_m": tk.StringVar(value="5"),
+            "coarse_grid": tk.StringVar(value="25"),
+            "smooth_window": tk.StringVar(value="1"),
+            "bearing_const": tk.StringVar(value="0"),
+            "bearing_field": tk.StringVar(value="Bearing"),
+            "distance_const": tk.StringVar(value="5"),
+            "distance_field": tk.StringVar(value="Distance"),
+            "z_field": tk.StringVar(value="Z_DSM"),
+        }
+
+        ttk.Label(frame_params, text="Start Longitude (°):").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["start_lon"], width=20).grid(row=0, column=1, sticky="w", **pad)
+
+        ttk.Label(frame_params, text="Start Latitude (°):").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["start_lat"], width=20).grid(row=1, column=1, sticky="w", **pad)
+
+        ttk.Label(frame_params, text="Search radius (m):").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["search_radius"], width=20).grid(row=2, column=1, sticky="w", **pad)
+
+        ttk.Label(frame_params, text="Fallback step (m):").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["step_m"], width=20).grid(row=3, column=1, sticky="w", **pad)
+
+        ttk.Label(frame_params, text="Perp step (m):").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["coarse_grid"], width=20).grid(row=4, column=1, sticky="w", **pad)
+
+        ttk.Label(frame_params, text="Smooth window:").grid(row=5, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["smooth_window"], width=20).grid(row=5, column=1, sticky="w", **pad)
+
+        ttk.Label(frame_params, text="CSV Z_DSM field:").grid(row=6, column=0, sticky="w", **pad)
+        self._z_combo = ttk.Combobox(frame_params, textvariable=self._param_vars["z_field"], width=22, state="normal")
+        self._z_combo.grid(row=6, column=1, sticky="w", **pad)
+
+        frame_bearing = ttk.LabelFrame(frame_params, text="Bearing source")
+        frame_bearing.grid(row=0, column=2, rowspan=3, sticky="nw", padx=12, pady=4)
+        self._bearing_mode = tk.StringVar(value="field")
+        ttk.Radiobutton(frame_bearing, text="CSV column", value="field", variable=self._bearing_mode, command=self._update_mode_state).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Radiobutton(frame_bearing, text="Constant", value="const", variable=self._bearing_mode, command=self._update_mode_state).grid(row=1, column=0, sticky="w", **pad)
+        ttk.Label(frame_bearing, text="Column:").grid(row=2, column=0, sticky="w", **pad)
+        self._bearing_combo = ttk.Combobox(frame_bearing, textvariable=self._param_vars["bearing_field"], width=22, state="readonly")
+        self._bearing_combo.grid(row=3, column=0, sticky="w", **pad)
+        ttk.Label(frame_bearing, text="Const azimuth (°):").grid(row=4, column=0, sticky="w", **pad)
+        self._bearing_const_entry = ttk.Entry(frame_bearing, textvariable=self._param_vars["bearing_const"], width=24)
+        self._bearing_const_entry.grid(row=5, column=0, sticky="w", **pad)
+
+        frame_distance = ttk.LabelFrame(frame_params, text="Distance source")
+        frame_distance.grid(row=3, column=2, rowspan=4, sticky="nw", padx=12, pady=4)
+        self._distance_mode = tk.StringVar(value="const")
+        ttk.Radiobutton(frame_distance, text="CSV column", value="field", variable=self._distance_mode, command=self._update_mode_state).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Radiobutton(frame_distance, text="Constant", value="const", variable=self._distance_mode, command=self._update_mode_state).grid(row=1, column=0, sticky="w", **pad)
+        ttk.Label(frame_distance, text="Column:").grid(row=2, column=0, sticky="w", **pad)
+        self._distance_combo = ttk.Combobox(frame_distance, textvariable=self._param_vars["distance_field"], width=22, state="readonly")
+        self._distance_combo.grid(row=3, column=0, sticky="w", **pad)
+        ttk.Label(frame_distance, text="Const distance:").grid(row=4, column=0, sticky="w", **pad)
+        self._distance_const_entry = ttk.Entry(frame_distance, textvariable=self._param_vars["distance_const"], width=24)
+        self._distance_const_entry.grid(row=5, column=0, sticky="w", **pad)
+        ttk.Label(frame_distance, text="Unit:").grid(row=6, column=0, sticky="w", **pad)
+        self._distance_unit = tk.StringVar(value="m")
+        self._distance_unit_combo = ttk.Combobox(frame_distance, textvariable=self._distance_unit, values=["m", "deg"], width=8, state="readonly")
+        self._distance_unit_combo.grid(row=7, column=0, sticky="w", **pad)
 
         frame_run = ttk.Frame(self)
         frame_run.grid(row=2, column=0, **pad)
@@ -190,35 +248,48 @@ class App(tk.Tk):
         self._btn_geojson = ttk.Button(frame_run, text="Save GeoJSON", state="disabled", command=self._save_geojson)
         self._btn_geojson.grid(row=0, column=3, padx=4)
 
-        self._progress = ttk.Progressbar(self, length=540, mode="determinate")
+        self._progress = ttk.Progressbar(self, length=620, mode="determinate")
         self._progress.grid(row=3, column=0, **pad)
 
         frame_log = ttk.LabelFrame(self, text="Log")
         frame_log.grid(row=4, column=0, sticky="nsew", **pad)
 
-        self._log = tk.Text(frame_log, height=14, width=90, state="disabled", font=("Consolas", 9))
+        self._log = tk.Text(frame_log, height=16, width=104, state="disabled", font=("Consolas", 9))
         self._log.grid(row=0, column=0)
         scrollbar = ttk.Scrollbar(frame_log, command=self._log.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self._log.configure(yscrollcommand=scrollbar.set)
 
+        self._update_mode_state()
+
     def _load_settings(self):
-        if not os.path.exists(SETTINGS_FILE):
-            return
-        try:
-            with open(SETTINGS_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            self._dsm_var.set(data.get("dsm", ""))
-            self._csv_var.set(data.get("csv", ""))
-            for key in self._param_vars:
-                if key in data:
-                    self._param_vars[key].set(data[key])
-        except Exception:
-            pass
+        data = {}
+        if os.path.exists(SETTINGS_FILE):
+            try:
+                with open(SETTINGS_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        self._dsm_var.set(data.get("dsm", ""))
+        self._csv_var.set(data.get("csv", ""))
+        for key, var in self._param_vars.items():
+            var.set(data.get(key, DEFAULT_PARAMS.get(key, var.get())))
+        self._bearing_mode.set(data.get("bearing_mode", DEFAULT_PARAMS["bearing_mode"]))
+        self._distance_mode.set(data.get("distance_mode", DEFAULT_PARAMS["distance_mode"]))
+        self._distance_unit.set(data.get("distance_unit", DEFAULT_PARAMS["distance_unit"]))
+        if self._csv_var.get() and os.path.exists(self._csv_var.get()):
+            self._load_csv_columns(self._csv_var.get())
+        self._update_mode_state()
 
     def _save_settings(self):
         try:
-            data = {"dsm": self._dsm_var.get(), "csv": self._csv_var.get()}
+            data = {
+                "dsm": self._dsm_var.get(),
+                "csv": self._csv_var.get(),
+                "bearing_mode": self._bearing_mode.get(),
+                "distance_mode": self._distance_mode.get(),
+                "distance_unit": self._distance_unit.get(),
+            }
             for key, var in self._param_vars.items():
                 data[key] = var.get()
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -230,20 +301,44 @@ class App(tk.Tk):
         self._save_settings()
         self.destroy()
 
+    def _load_csv_columns(self, path: str):
+        cols = read_csv_columns(path)
+        self._csv_columns = cols
+        self._bearing_combo["values"] = cols
+        self._distance_combo["values"] = cols
+        self._z_combo["values"] = cols
+        if cols:
+            self._log_write(f"CSV columns detected: {cols}")
+            lower_map = {c.strip().lower(): c for c in cols}
+            if "bearing" in lower_map:
+                self._param_vars["bearing_field"].set(lower_map["bearing"])
+            if "z_dsm" in lower_map:
+                self._param_vars["z_field"].set(lower_map["z_dsm"])
+            if "distance" in lower_map:
+                self._param_vars["distance_field"].set(lower_map["distance"])
+
     def _browse_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
         if not path:
             return
         self._csv_var.set(path)
-        cols = read_csv_columns(path)
-        if cols:
-            self._log_write(f"CSV columns detected: {cols}")
-            bearing_candidates = [c for c in cols if c.strip().lower() == "bearing"]
-            z_candidates = [c for c in cols if c.strip().lower() == "z_dsm"]
-            if bearing_candidates:
-                self._param_vars["bearing_field"].set(bearing_candidates[0].strip())
-            if z_candidates:
-                self._param_vars["z_field"].set(z_candidates[0].strip())
+        self._load_csv_columns(path)
+        self._update_mode_state()
+
+    def _update_mode_state(self):
+        if self._bearing_mode.get() == "field":
+            self._bearing_combo.configure(state="readonly")
+            self._bearing_const_entry.configure(state="disabled")
+        else:
+            self._bearing_combo.configure(state="disabled")
+            self._bearing_const_entry.configure(state="normal")
+
+        if self._distance_mode.get() == "field":
+            self._distance_combo.configure(state="readonly")
+            self._distance_const_entry.configure(state="disabled")
+        else:
+            self._distance_combo.configure(state="disabled")
+            self._distance_const_entry.configure(state="normal")
 
     def _log_write(self, msg: str):
         self._log.configure(state="normal")
@@ -269,17 +364,24 @@ class App(tk.Tk):
             return
 
         try:
-            start_lon = float(self._param_vars["start_lon"].get())
-            start_lat = float(self._param_vars["start_lat"].get())
-            search_radius = float(self._param_vars["search_radius"].get())
-            step_m = float(self._param_vars["step_m"].get())
-            coarse_grid = float(self._param_vars["coarse_grid"].get())
+            start_lon = float(self._param_vars["start_lon"].get().replace(",", "."))
+            start_lat = float(self._param_vars["start_lat"].get().replace(",", "."))
+            search_radius = float(self._param_vars["search_radius"].get().replace(",", "."))
+            step_m = float(self._param_vars["step_m"].get().replace(",", "."))
+            coarse_grid = float(self._param_vars["coarse_grid"].get().replace(",", "."))
             smooth_window = int(self._param_vars["smooth_window"].get())
+            bearing_const = float(self._param_vars["bearing_const"].get().replace(",", "."))
+            distance_const = float(self._param_vars["distance_const"].get().replace(",", "."))
             bearing_field = self._param_vars["bearing_field"].get().strip()
+            distance_field = self._param_vars["distance_field"].get().strip()
             z_field = self._param_vars["z_field"].get().strip()
         except ValueError as e:
             messagebox.showerror("Error", f"Invalid parameter: {e}")
             return
+
+        bearing_mode = self._bearing_mode.get()
+        distance_mode = self._distance_mode.get()
+        distance_unit = self._distance_unit.get()
 
         self._stop_event.clear()
         self._btn_run.configure(state="disabled")
@@ -297,13 +399,27 @@ class App(tk.Tk):
             try:
                 cols = read_csv_columns(csv_path)
                 self._log_write_safe(f"CSV columns: {cols}")
-                self._log_write_safe(f"Using bearing='{bearing_field}', z='{z_field}'")
+                self._log_write_safe(
+                    f"Using bearing mode='{bearing_mode}', field='{bearing_field}', const={bearing_const}; "
+                    f"distance mode='{distance_mode}', field='{distance_field}', const={distance_const} {distance_unit}; "
+                    f"z='{z_field}'"
+                )
 
-                profile = load_profile(csv_path, bearing_field, z_field)
+                profile = load_profile(
+                    csv_path,
+                    bearing_mode=bearing_mode,
+                    bearing_field=bearing_field,
+                    bearing_const=bearing_const,
+                    z_field=z_field,
+                    distance_mode=distance_mode,
+                    distance_field=distance_field,
+                    distance_const=distance_const,
+                    distance_unit=distance_unit,
+                )
                 self._log_write_safe(f"Loaded {len(profile)} points.")
                 self._log_write_safe(
                     f"Search from ({start_lat:.6f}, {start_lon:.6f}), radius={search_radius} m, "
-                    f"step={step_m} m, perp_step={coarse_grid} m..."
+                    f"fallback_step={step_m} m, perp_step={coarse_grid} m..."
                 )
 
                 result = run_search(
@@ -348,7 +464,7 @@ class App(tk.Tk):
         self._log_write("-" * 60)
         self._log_write("RESULT:")
         self._log_write(f"  Start:         Lon={result.start_lon:.8f}  Lat={result.start_lat:.8f}")
-        self._log_write(f"  Bearing:       {result.bearing:.4f}")
+        self._log_write(f"  Base bearing:  {result.bearing:.4f}")
         self._log_write(f"  Perp offset:   {result.perp_offset_m:.3f} m")
         self._log_write(f"  Along shift:   {result.best_shift_points} pts")
         self._log_write(f"  RMSE:          {result.rmse:.4f} m")
