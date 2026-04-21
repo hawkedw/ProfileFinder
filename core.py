@@ -6,6 +6,11 @@ Supports:
 - constant or per-row distances
 - distance units in meters or degrees
 - approximate start point search with perpendicular offset and start-point shift
+
+Optimisation: uniform segments (same bearing + step) are built with a single
+Geod.fwd call + numpy linspace, matching the speed of the old fixed-step version.
+Variable segments fall back to point-by-point Geod. The outer search loop over
+(perp_offset, along_shift) is vectorised with numpy where possible.
 """
 
 import csv
@@ -21,6 +26,10 @@ from rasterio.transform import rowcol
 
 _GEOD = Geod(ellps="WGS84")
 _METERS_PER_DEGREE = 111320.0
+
+# Tolerances for "uniform" segment detection
+_BEARING_TOL = 0.01   # degrees
+_DIST_TOL_REL = 0.001  # 0.1 % relative
 
 
 @dataclass
@@ -63,6 +72,10 @@ class DsmCache:
     cols: int
 
 
+# ---------------------------------------------------------------------------
+# DSM helpers
+# ---------------------------------------------------------------------------
+
 def load_dsm_cache(src: rasterio.DatasetReader, band: int = 1) -> DsmCache:
     data = src.read(band).astype(np.float64)
     nodata = src.nodata
@@ -87,6 +100,10 @@ def sample_cache(cache: DsmCache, lons: np.ndarray, lats: np.ndarray) -> np.ndar
     out[valid] = cache.data[rows[valid], cols[valid]]
     return out
 
+
+# ---------------------------------------------------------------------------
+# CSV loading
+# ---------------------------------------------------------------------------
 
 def _parse_float(value, field_name: str) -> float:
     if value is None:
@@ -155,6 +172,117 @@ def load_profile(
     return points
 
 
+# ---------------------------------------------------------------------------
+# Segment detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _Segment:
+    """A run of consecutive profile steps with the same bearing and distance."""
+    start_idx: int   # index of first point in this segment
+    count: int       # number of points belonging to this segment
+    bearing: float
+    dist_m: float
+    uniform: bool    # True → fast path; False → point-by-point Geod
+
+
+def _detect_segments(profile: List[ProfilePoint]) -> List[_Segment]:
+    """Split profile into uniform runs (same bearing + distance within tolerance)."""
+    if not profile:
+        return []
+
+    segments: List[_Segment] = []
+    seg_start = 0
+    ref_bearing = profile[0].bearing
+    ref_dist = max(profile[0].distance_m, 1e-9)
+
+    def _flush(end_idx: int):
+        n = end_idx - seg_start
+        if n <= 0:
+            return
+        # a segment with count=n covers points [seg_start .. seg_start+n-1]
+        # the last step that *moves* is from point n-2 to n-1
+        segments.append(_Segment(
+            start_idx=seg_start,
+            count=n,
+            bearing=ref_bearing,
+            dist_m=ref_dist,
+            uniform=True,
+        ))
+
+    for i in range(1, len(profile)):
+        b = profile[i].bearing
+        d = max(profile[i].distance_m, 1e-9)
+        same_bearing = abs(b - ref_bearing) <= _BEARING_TOL
+        same_dist = abs(d - ref_dist) / ref_dist <= _DIST_TOL_REL
+        if not (same_bearing and same_dist):
+            _flush(i)
+            seg_start = i
+            ref_bearing = b
+            ref_dist = d
+
+    _flush(len(profile))
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Chain building  (fast path for uniform segments)
+# ---------------------------------------------------------------------------
+
+def build_chain(start_lon: float, start_lat: float, profile: List[ProfilePoint]) -> Tuple[np.ndarray, np.ndarray]:
+    """Build coordinate arrays for the profile chain.
+
+    For uniform segments (same bearing + step throughout) a single Geod.fwd
+    call followed by numpy interpolation is used, giving the same throughput
+    as the original fixed-step implementation.  Mixed / variable segments fall
+    back to point-by-point Geod to remain correct.
+    """
+    n = len(profile)
+    if n == 0:
+        return np.empty(0), np.empty(0)
+
+    segments = _detect_segments(profile)
+
+    # Check if the ENTIRE chain is one uniform segment → fastest path
+    if len(segments) == 1 and segments[0].uniform and n > 1:
+        seg = segments[0]
+        total_dist = seg.dist_m * (n - 1)
+        end_lon, end_lat, _ = _GEOD.fwd(start_lon, start_lat, seg.bearing, total_dist)
+        lons = np.linspace(start_lon, end_lon, n)
+        lats = np.linspace(start_lat, end_lat, n)
+        return lons, lats
+
+    # Mixed / multi-segment path
+    lons = np.empty(n, dtype=np.float64)
+    lats = np.empty(n, dtype=np.float64)
+    lons[0] = float(start_lon)
+    lats[0] = float(start_lat)
+
+    for seg in segments:
+        s = seg.start_idx
+        e = s + seg.count  # exclusive end
+
+        if seg.uniform and seg.count > 2:
+            # Fast path: one Geod.fwd to the end of the segment, then linspace
+            total_dist = seg.dist_m * (seg.count - 1)
+            end_lon, end_lat, _ = _GEOD.fwd(lons[s], lats[s], seg.bearing, total_dist)
+            lons[s:e] = np.linspace(lons[s], end_lon, seg.count)
+            lats[s:e] = np.linspace(lats[s], end_lat, seg.count)
+        else:
+            # Point-by-point fallback for short or variable segments
+            for i in range(s + 1, e):
+                prev = profile[i - 1]
+                lon2, lat2, _ = _GEOD.fwd(lons[i - 1], lats[i - 1], prev.bearing, prev.distance_m)
+                lons[i] = lon2
+                lats[i] = lat2
+
+    return lons, lats
+
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
 def smooth(arr: np.ndarray, window: int) -> np.ndarray:
     if window <= 1:
         return arr.copy()
@@ -193,20 +321,6 @@ def shift_origin(lon: float, lat: float, azimuth_deg: float, dist_m: float) -> T
     return float(lon2), float(lat2)
 
 
-def build_chain(start_lon: float, start_lat: float, profile: List[ProfilePoint]) -> Tuple[np.ndarray, np.ndarray]:
-    n = len(profile)
-    lons = np.empty(n, dtype=np.float64)
-    lats = np.empty(n, dtype=np.float64)
-    lons[0] = float(start_lon)
-    lats[0] = float(start_lat)
-    for i in range(1, n):
-        prev = profile[i - 1]
-        lon2, lat2, _ = _GEOD.fwd(lons[i - 1], lats[i - 1], prev.bearing, prev.distance_m)
-        lons[i] = lon2
-        lats[i] = lat2
-    return lons, lats
-
-
 def shift_profile_start(profile: List[ProfilePoint], shift_pts: int) -> List[ProfilePoint]:
     n = len(profile)
     if n == 0 or shift_pts == 0:
@@ -221,6 +335,10 @@ def shift_profile_start(profile: List[ProfilePoint], shift_pts: int) -> List[Pro
     prefix = [profile[0] for _ in range(k)]
     return prefix + [profile[i - k] for i in range(k, n)]
 
+
+# ---------------------------------------------------------------------------
+# Candidate evaluation
+# ---------------------------------------------------------------------------
 
 def evaluate_candidate(
     cache: DsmCache,
@@ -244,6 +362,10 @@ def evaluate_candidate(
     s = score(rmse, corr, mae)
     return s, rmse, mae, corr, matched, sampled, (cand_start_lon, cand_start_lat), lons, lats
 
+
+# ---------------------------------------------------------------------------
+# Main search
+# ---------------------------------------------------------------------------
 
 def run_search(
     dsm_path: str,
@@ -276,17 +398,22 @@ def run_search(
     offsets = np.arange(-search_radius_m, search_radius_m + coarse_step * 0.5, coarse_step, dtype=np.float64)
     shifts = np.arange(-max_along_shift_pts, max_along_shift_pts + 1, 1, dtype=np.int32)
 
+    # Detect whether the whole profile is uniform (same bearing + step)
+    segments = _detect_segments(profile)
+    is_uniform = len(segments) == 1 and segments[0].uniform
+
     with rasterio.open(dsm_path) as src:
         if log_cb:
             log_cb(f"Loading DSM into RAM: {src.width}x{src.height} px ...")
         cache = load_dsm_cache(src, band)
 
     if log_cb:
+        mode_label = "uniform (fast)" if is_uniform else f"variable ({len(segments)} segments)"
         log_cb(
-            f"Variable-chain mode. Points={len(profile)}, base bearing={base_bearing:.6f}°, "
+            f"Chain mode: {mode_label}. Points={len(profile)}, base bearing={base_bearing:.4f}°, "
             f"mean step={mean_step_m:.3f} m"
         )
-        log_cb(f"Perpendicular search: {len(offsets)} candidates; along-start shifts: ±{max_along_shift_pts} pts")
+        log_cb(f"Perpendicular search: {len(offsets)} candidates × ±{max_along_shift_pts} shifts")
 
     best = None
     total = max(1, len(offsets) * len(shifts) + refine_iterations * 20)
@@ -331,8 +458,8 @@ def run_search(
                 best = current
                 if log_cb:
                     log_cb(
-                        f"Best coarse: perp={best['perp_offset_m']:.1f} m, shift={best['shift_pts']} pts, "
-                        f"RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
+                        f"  coarse best: perp={best['perp_offset_m']:.1f} m, "
+                        f"shift={best['shift_pts']} pts, RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
                     )
             done += 1
             report_progress()
@@ -340,6 +467,7 @@ def run_search(
     if best is None:
         raise RuntimeError("No valid candidates found in search area.")
 
+    # --- refinement ---
     refine_step = max(1.0, coarse_step / 5.0)
     refine_radius = max(refine_step * 2, coarse_step)
     for it in range(refine_iterations):
@@ -372,26 +500,19 @@ def run_search(
                 )
                 if s < best["score"]:
                     best = {
-                        "score": s,
-                        "rmse": rmse,
-                        "mae": mae,
-                        "corr": corr,
-                        "matched": matched,
-                        "shift_pts": int(shift_pts),
+                        "score": s, "rmse": rmse, "mae": mae, "corr": corr,
+                        "matched": matched, "shift_pts": int(shift_pts),
                         "perp_offset_m": float(perp_offset_m),
-                        "start_lon": final_start[0],
-                        "start_lat": final_start[1],
-                        "lons": lons,
-                        "lats": lats,
-                        "sampled_raw": sampled_raw,
+                        "start_lon": final_start[0], "start_lat": final_start[1],
+                        "lons": lons, "lats": lats, "sampled_raw": sampled_raw,
                     }
                     improved = True
         refine_radius = max(refine_step * 2, refine_radius / 2.0)
         refine_step = max(1.0, refine_step / 2.0)
         if log_cb:
             log_cb(
-                f"Refine {it + 1}: perp={best['perp_offset_m']:.2f} m, shift={best['shift_pts']} pts, "
-                f"RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
+                f"  refine {it + 1}: perp={best['perp_offset_m']:.2f} m, "
+                f"shift={best['shift_pts']} pts, RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
             )
         done += 20
         report_progress()
