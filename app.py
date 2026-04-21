@@ -127,9 +127,22 @@ def write_result_geojson(path: str, result: SearchResult):
 
 def read_csv_columns(path: str) -> list:
     with open(path, newline="", encoding="utf-8-sig") as f:
-        reader = csv.reader(f)
+        sample = f.read(8192)
+        f.seek(0)
         try:
-            return [c.strip() for c in next(reader)]
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+        reader = csv.reader(f, dialect=dialect)
+        try:
+            row = next(reader)
+            # если снифер не справился и вернул одно поле с разделителями внутри — пробуем ещё раз
+            if len(row) == 1:
+                for sep in (";", "\t", "|", ","):
+                    parts = row[0].split(sep)
+                    if len(parts) > 1:
+                        return [c.strip() for c in parts]
+            return [c.strip() for c in row]
         except StopIteration:
             return []
 
@@ -211,7 +224,7 @@ class App(tk.Tk):
         ttk.Radiobutton(frame_bearing, text="CSV column", value="field", variable=self._bearing_mode, command=self._update_mode_state).grid(row=0, column=0, sticky="w", **pad)
         ttk.Radiobutton(frame_bearing, text="Constant", value="const", variable=self._bearing_mode, command=self._update_mode_state).grid(row=1, column=0, sticky="w", **pad)
         ttk.Label(frame_bearing, text="Column:").grid(row=2, column=0, sticky="w", **pad)
-        self._bearing_combo = ttk.Combobox(frame_bearing, textvariable=self._param_vars["bearing_field"], width=22, state="readonly")
+        self._bearing_combo = ttk.Combobox(frame_bearing, textvariable=self._param_vars["bearing_field"], width=22, state="readonly", postcommand=self._refresh_bearing_combo)
         self._bearing_combo.grid(row=3, column=0, sticky="w", **pad)
         ttk.Label(frame_bearing, text="Const azimuth (°):").grid(row=4, column=0, sticky="w", **pad)
         self._bearing_const_entry = ttk.Entry(frame_bearing, textvariable=self._param_vars["bearing_const"], width=24)
@@ -223,7 +236,7 @@ class App(tk.Tk):
         ttk.Radiobutton(frame_distance, text="CSV column", value="field", variable=self._distance_mode, command=self._update_mode_state).grid(row=0, column=0, sticky="w", **pad)
         ttk.Radiobutton(frame_distance, text="Constant", value="const", variable=self._distance_mode, command=self._update_mode_state).grid(row=1, column=0, sticky="w", **pad)
         ttk.Label(frame_distance, text="Column:").grid(row=2, column=0, sticky="w", **pad)
-        self._distance_combo = ttk.Combobox(frame_distance, textvariable=self._param_vars["distance_field"], width=22, state="readonly")
+        self._distance_combo = ttk.Combobox(frame_distance, textvariable=self._param_vars["distance_field"], width=22, state="readonly", postcommand=self._refresh_distance_combo)
         self._distance_combo.grid(row=3, column=0, sticky="w", **pad)
         ttk.Label(frame_distance, text="Const distance:").grid(row=4, column=0, sticky="w", **pad)
         self._distance_const_entry = ttk.Entry(frame_distance, textvariable=self._param_vars["distance_const"], width=24)
@@ -261,6 +274,12 @@ class App(tk.Tk):
         self._log.configure(yscrollcommand=scrollbar.set)
 
         self._update_mode_state()
+
+    def _refresh_bearing_combo(self):
+        self._bearing_combo["values"] = self._csv_columns
+
+    def _refresh_distance_combo(self):
+        self._distance_combo["values"] = self._csv_columns
 
     def _load_settings(self):
         data = {}
