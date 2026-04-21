@@ -28,7 +28,7 @@ _GEOD = Geod(ellps="WGS84")
 _METERS_PER_DEGREE = 111320.0
 
 # Tolerances for "uniform" segment detection
-_BEARING_TOL = 0.01   # degrees
+_BEARING_TOL = 0.001   # degrees
 _DIST_TOL_REL = 0.001  # 0.1 % relative
 
 
@@ -230,51 +230,20 @@ def _detect_segments(profile: List[ProfilePoint]) -> List[_Segment]:
 # ---------------------------------------------------------------------------
 
 def build_chain(start_lon: float, start_lat: float, profile: List[ProfilePoint]) -> Tuple[np.ndarray, np.ndarray]:
-    """Build coordinate arrays for the profile chain.
-
-    For uniform segments (same bearing + step throughout) a single Geod.fwd
-    call followed by numpy interpolation is used, giving the same throughput
-    as the original fixed-step implementation.  Mixed / variable segments fall
-    back to point-by-point Geod to remain correct.
-    """
     n = len(profile)
     if n == 0:
         return np.empty(0), np.empty(0)
 
-    segments = _detect_segments(profile)
-
-    # Check if the ENTIRE chain is one uniform segment → fastest path
-    if len(segments) == 1 and segments[0].uniform and n > 1:
-        seg = segments[0]
-        total_dist = seg.dist_m * (n - 1)
-        end_lon, end_lat, _ = _GEOD.fwd(start_lon, start_lat, seg.bearing, total_dist)
-        lons = np.linspace(start_lon, end_lon, n)
-        lats = np.linspace(start_lat, end_lat, n)
-        return lons, lats
-
-    # Mixed / multi-segment path
     lons = np.empty(n, dtype=np.float64)
     lats = np.empty(n, dtype=np.float64)
     lons[0] = float(start_lon)
     lats[0] = float(start_lat)
 
-    for seg in segments:
-        s = seg.start_idx
-        e = s + seg.count  # exclusive end
-
-        if seg.uniform and seg.count > 2:
-            # Fast path: one Geod.fwd to the end of the segment, then linspace
-            total_dist = seg.dist_m * (seg.count - 1)
-            end_lon, end_lat, _ = _GEOD.fwd(lons[s], lats[s], seg.bearing, total_dist)
-            lons[s:e] = np.linspace(lons[s], end_lon, seg.count)
-            lats[s:e] = np.linspace(lats[s], end_lat, seg.count)
-        else:
-            # Point-by-point fallback for short or variable segments
-            for i in range(s + 1, e):
-                prev = profile[i - 1]
-                lon2, lat2, _ = _GEOD.fwd(lons[i - 1], lats[i - 1], prev.bearing, prev.distance_m)
-                lons[i] = lon2
-                lats[i] = lat2
+    for i in range(1, n):
+        prev = profile[i - 1]
+        lon2, lat2, _ = _GEOD.fwd(lons[i - 1], lats[i - 1], prev.bearing, prev.distance_m)
+        lons[i] = lon2
+        lats[i] = lat2
 
     return lons, lats
 
