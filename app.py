@@ -33,6 +33,13 @@ DEFAULT_PARAMS = {
     "z_field": "Z_DSM",
 }
 
+# migration: old key -> new key
+_KEY_MIGRATION = {
+    "start_lon": "approx_last_lon",
+    "start_lat": "approx_last_lat",
+    "step_m": None,  # removed
+}
+
 
 def _browse_file(var: tk.StringVar, filetypes):
     path = filedialog.askopenfilename(filetypes=filetypes)
@@ -286,15 +293,30 @@ class App(tk.Tk):
                     data = json.load(f)
             except Exception:
                 data = {}
+
+        # migrate old keys
+        for old_key, new_key in _KEY_MIGRATION.items():
+            if old_key in data and new_key and new_key not in data:
+                data[new_key] = data[old_key]
+
+        # restore file paths
         self._dsm_var.set(data.get("dsm", DEFAULT_PARAMS["dsm"]))
         self._csv_var.set(data.get("csv", DEFAULT_PARAMS["csv"]))
+
+        # restore all param vars
         for key, var in self._param_vars.items():
-            var.set(data.get(key, DEFAULT_PARAMS.get(key, var.get())))
+            var.set(str(data.get(key, DEFAULT_PARAMS.get(key, var.get()))))
+
+        # restore mode selectors
         self._bearing_mode.set(data.get("bearing_mode", DEFAULT_PARAMS["bearing_mode"]))
         self._distance_mode.set(data.get("distance_mode", DEFAULT_PARAMS["distance_mode"]))
         self._distance_unit.set(data.get("distance_unit", DEFAULT_PARAMS["distance_unit"]))
-        if self._csv_var.get() and os.path.exists(self._csv_var.get()):
-            self._load_csv_columns(self._csv_var.get())
+
+        # reload CSV columns if file exists
+        csv_path = self._csv_var.get()
+        if csv_path and os.path.exists(csv_path):
+            self._load_csv_columns(csv_path)
+
         self._update_mode_state()
 
     def _save_settings(self):
