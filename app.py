@@ -312,7 +312,7 @@ class App(tk.Tk):
         self._distance_mode.set(data.get("distance_mode", DEFAULT_PARAMS["distance_mode"]))
         self._distance_unit.set(data.get("distance_unit", DEFAULT_PARAMS["distance_unit"]))
 
-        # reload CSV columns if file exists
+        # reload CSV columns if file exists (не перезаписывает поля из settings.json)
         csv_path = self._csv_var.get()
         if csv_path and os.path.exists(csv_path):
             self._load_csv_columns(csv_path)
@@ -339,7 +339,7 @@ class App(tk.Tk):
         self._save_settings()
         self.destroy()
 
-    def _load_csv_columns(self, path: str):
+    def _load_csv_columns(self, path: str, restore_fields: bool = False):
         cols = read_csv_columns(path)
         self._csv_columns = cols
         self._bearing_combo["values"] = cols
@@ -347,24 +347,27 @@ class App(tk.Tk):
         self._z_combo["values"] = cols
         if cols:
             self._log_write(f"CSV columns detected: {cols}")
-            lower_map = {c.strip().lower(): c for c in cols}
-            for candidate in ("bear_prev", "bearing"):
-                if candidate in lower_map:
-                    self._param_vars["bearing_field"].set(lower_map[candidate])
-                    break
-            for candidate in ("dist_prev", "distance"):
-                if candidate in lower_map:
-                    self._param_vars["distance_field"].set(lower_map[candidate])
-                    break
-            if "z_dsm" in lower_map:
-                self._param_vars["z_field"].set(lower_map["z_dsm"])
+            # автодетект только если явно запрошен (при browse),
+            # при восстановлении настроек — не перезаписываем
+            if restore_fields:
+                lower_map = {c.strip().lower(): c for c in cols}
+                for candidate in ("bear_prev", "bearing"):
+                    if candidate in lower_map:
+                        self._param_vars["bearing_field"].set(lower_map[candidate])
+                        break
+                for candidate in ("dist_prev", "distance"):
+                    if candidate in lower_map:
+                        self._param_vars["distance_field"].set(lower_map[candidate])
+                        break
+                if "z_dsm" in lower_map:
+                    self._param_vars["z_field"].set(lower_map["z_dsm"])
 
     def _browse_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
         if not path:
             return
         self._csv_var.set(path)
-        self._load_csv_columns(path)
+        self._load_csv_columns(path, restore_fields=True)
         self._update_mode_state()
 
     def _update_mode_state(self):

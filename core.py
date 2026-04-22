@@ -452,6 +452,17 @@ def run_search(
             f"offset={dist_offset:.2f} m, "
             f"RMSE={rmse:.4f}, corr={corr:.4f}, matched={matched}/{len(profile)}"
         )
+
+    # --- quality check ---
+    MAX_ACCEPTABLE_RMSE = 15.0  # метров — если хуже, результат ненадёжен
+
+    if rmse > MAX_ACCEPTABLE_RMSE:
+        if log_cb:
+            log_cb(
+                f"WARNING: RMSE={rmse:.2f} m exceeds threshold ({MAX_ACCEPTABLE_RMSE} m). "
+                f"Result may be unreliable. Consider increasing search_radius or checking approx coordinate."
+            )
+
     if progress_cb:
         progress_cb(1.0)
 
