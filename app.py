@@ -17,10 +17,10 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settin
 DEFAULT_PARAMS = {
     "dsm": "",
     "csv": "",
-    "start_lon": "0.0",
-    "start_lat": "0.0",
-    "search_radius": "5000",
-    "step_m": "5",
+    "approx_last_lon": "0.0",
+    "approx_last_lat": "0.0",
+    "search_radius": "1000",
+    "bearing_cone": "45",
     "coarse_grid": "25",
     "smooth_window": "1",
     "bearing_mode": "field",
@@ -43,7 +43,7 @@ def _browse_file(var: tk.StringVar, filetypes):
 def write_result_csv(path: str, result: SearchResult):
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["Id", "Lon", "Lat", "Z_DSM", "Bearing", "DistanceValue", "DistanceUnit", "Z_sampled", "dZ"])
+        w.writerow(["Id", "Lon", "Lat", "Z_DSM", "BEAR_PREV", "DIST_PREV_m", "Z_sampled", "dZ"])
         count = min(len(result.points), len(result.profile), len(result.z_sampled))
         for i in range(count):
             lon, lat = result.points[i]
@@ -56,11 +56,10 @@ def write_result_csv(path: str, result: SearchResult):
                 round(lon, 8),
                 round(lat, 8),
                 round(z_dsm, 4),
-                round(profile_pt.bearing, 4),
-                round(profile_pt.distance_value, 6),
-                profile_pt.distance_unit,
-                "" if z_samp is None or not isinstance(z_samp, (int, float)) or z_samp != z_samp else round(z_samp, 4),
-                "" if dz is None or dz != dz else round(dz, 4),
+                round(profile_pt.bear_prev, 4),
+                round(profile_pt.dist_prev_m, 4),
+                "" if z_samp is None or (isinstance(z_samp, float) and z_samp != z_samp) else round(z_samp, 4),
+                "" if dz is None or (isinstance(dz, float) and dz != dz) else round(dz, 4),
             ])
 
 
@@ -79,9 +78,8 @@ def write_result_geojson(path: str, result: SearchResult):
             "Lon": round(lon, 8),
             "Lat": round(lat, 8),
             "Z_DSM": round(z_dsm, 4),
-            "Bearing": round(profile_pt.bearing, 4),
-            "DistanceValue": round(profile_pt.distance_value, 6),
-            "DistanceUnit": profile_pt.distance_unit,
+            "BEAR_PREV": round(profile_pt.bear_prev, 4),
+            "DIST_PREV_m": round(profile_pt.dist_prev_m, 4),
             "Z_sampled": None if z_samp is None or (isinstance(z_samp, float) and z_samp != z_samp) else round(z_samp, 4),
             "dZ": None if dz is None or (isinstance(dz, float) and dz != dz) else round(dz, 4),
         }
@@ -103,9 +101,9 @@ def write_result_geojson(path: str, result: SearchResult):
                 "MAE": round(result.mae, 4),
                 "Pearson": round(result.corr, 4),
                 "Matched": result.matched,
-                "Bearing": round(result.bearing, 4),
                 "PerpOffset_m": round(result.perp_offset_m, 3),
-                "AlongShiftPts": result.best_shift_points,
+                "LastLon": round(result.last_lon, 8),
+                "LastLat": round(result.last_lat, 8),
             },
             "geometry": {
                 "type": "LineString",
@@ -182,32 +180,32 @@ class App(tk.Tk):
         frame_params.grid(row=1, column=0, sticky="ew", **pad)
 
         self._param_vars = {
-            "start_lon":      tk.StringVar(value=DEFAULT_PARAMS["start_lon"]),
-            "start_lat":      tk.StringVar(value=DEFAULT_PARAMS["start_lat"]),
-            "search_radius":  tk.StringVar(value=DEFAULT_PARAMS["search_radius"]),
-            "step_m":         tk.StringVar(value=DEFAULT_PARAMS["step_m"]),
-            "coarse_grid":    tk.StringVar(value=DEFAULT_PARAMS["coarse_grid"]),
-            "smooth_window":  tk.StringVar(value=DEFAULT_PARAMS["smooth_window"]),
-            "bearing_const":  tk.StringVar(value=DEFAULT_PARAMS["bearing_const"]),
-            "bearing_field":  tk.StringVar(value=DEFAULT_PARAMS["bearing_field"]),
-            "distance_const": tk.StringVar(value=DEFAULT_PARAMS["distance_const"]),
-            "distance_field": tk.StringVar(value=DEFAULT_PARAMS["distance_field"]),
-            "z_field":        tk.StringVar(value=DEFAULT_PARAMS["z_field"]),
+            "approx_last_lon": tk.StringVar(value=DEFAULT_PARAMS["approx_last_lon"]),
+            "approx_last_lat": tk.StringVar(value=DEFAULT_PARAMS["approx_last_lat"]),
+            "search_radius":   tk.StringVar(value=DEFAULT_PARAMS["search_radius"]),
+            "bearing_cone":    tk.StringVar(value=DEFAULT_PARAMS["bearing_cone"]),
+            "coarse_grid":     tk.StringVar(value=DEFAULT_PARAMS["coarse_grid"]),
+            "smooth_window":   tk.StringVar(value=DEFAULT_PARAMS["smooth_window"]),
+            "bearing_const":   tk.StringVar(value=DEFAULT_PARAMS["bearing_const"]),
+            "bearing_field":   tk.StringVar(value=DEFAULT_PARAMS["bearing_field"]),
+            "distance_const":  tk.StringVar(value=DEFAULT_PARAMS["distance_const"]),
+            "distance_field":  tk.StringVar(value=DEFAULT_PARAMS["distance_field"]),
+            "z_field":         tk.StringVar(value=DEFAULT_PARAMS["z_field"]),
         }
 
-        ttk.Label(frame_params, text="Start Longitude (°):").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(frame_params, textvariable=self._param_vars["start_lon"], width=20).grid(row=0, column=1, sticky="w", **pad)
+        ttk.Label(frame_params, text="Last point Lon (°):").grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["approx_last_lon"], width=20).grid(row=0, column=1, sticky="w", **pad)
 
-        ttk.Label(frame_params, text="Start Latitude (°):").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(frame_params, textvariable=self._param_vars["start_lat"], width=20).grid(row=1, column=1, sticky="w", **pad)
+        ttk.Label(frame_params, text="Last point Lat (°):").grid(row=1, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["approx_last_lat"], width=20).grid(row=1, column=1, sticky="w", **pad)
 
         ttk.Label(frame_params, text="Search radius (m):").grid(row=2, column=0, sticky="w", **pad)
         ttk.Entry(frame_params, textvariable=self._param_vars["search_radius"], width=20).grid(row=2, column=1, sticky="w", **pad)
 
-        ttk.Label(frame_params, text="Fallback step (m):").grid(row=3, column=0, sticky="w", **pad)
-        ttk.Entry(frame_params, textvariable=self._param_vars["step_m"], width=20).grid(row=3, column=1, sticky="w", **pad)
+        ttk.Label(frame_params, text="Bearing cone (°):").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Entry(frame_params, textvariable=self._param_vars["bearing_cone"], width=20).grid(row=3, column=1, sticky="w", **pad)
 
-        ttk.Label(frame_params, text="Perp step (m):").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Label(frame_params, text="Grid step (m):").grid(row=4, column=0, sticky="w", **pad)
         ttk.Entry(frame_params, textvariable=self._param_vars["coarse_grid"], width=20).grid(row=4, column=1, sticky="w", **pad)
 
         ttk.Label(frame_params, text="Smooth window:").grid(row=5, column=0, sticky="w", **pad)
@@ -328,12 +326,10 @@ class App(tk.Tk):
         if cols:
             self._log_write(f"CSV columns detected: {cols}")
             lower_map = {c.strip().lower(): c for c in cols}
-            # авто-выбор: BEAR_PREV приоритетнее BEARING
             for candidate in ("bear_prev", "bearing"):
                 if candidate in lower_map:
                     self._param_vars["bearing_field"].set(lower_map[candidate])
                     break
-            # авто-выбор: DIST_PREV приоритетнее DISTANCE
             for candidate in ("dist_prev", "distance"):
                 if candidate in lower_map:
                     self._param_vars["distance_field"].set(lower_map[candidate])
@@ -388,22 +384,22 @@ class App(tk.Tk):
             return
 
         try:
-            start_lon = float(self._param_vars["start_lon"].get().replace(",", "."))
-            start_lat = float(self._param_vars["start_lat"].get().replace(",", "."))
-            search_radius = float(self._param_vars["search_radius"].get().replace(",", "."))
-            step_m = float(self._param_vars["step_m"].get().replace(",", "."))
-            coarse_grid = float(self._param_vars["coarse_grid"].get().replace(",", "."))
-            smooth_window = int(self._param_vars["smooth_window"].get())
-            bearing_const = float(self._param_vars["bearing_const"].get().replace(",", "."))
-            distance_const = float(self._param_vars["distance_const"].get().replace(",", "."))
-            bearing_field = self._param_vars["bearing_field"].get().strip()
-            distance_field = self._param_vars["distance_field"].get().strip()
-            z_field = self._param_vars["z_field"].get().strip()
+            approx_last_lon  = float(self._param_vars["approx_last_lon"].get().replace(",", "."))
+            approx_last_lat  = float(self._param_vars["approx_last_lat"].get().replace(",", "."))
+            search_radius    = float(self._param_vars["search_radius"].get().replace(",", "."))
+            bearing_cone     = float(self._param_vars["bearing_cone"].get().replace(",", "."))
+            coarse_grid      = float(self._param_vars["coarse_grid"].get().replace(",", "."))
+            smooth_window    = int(self._param_vars["smooth_window"].get())
+            bearing_const    = float(self._param_vars["bearing_const"].get().replace(",", "."))
+            distance_const   = float(self._param_vars["distance_const"].get().replace(",", "."))
+            bearing_field    = self._param_vars["bearing_field"].get().strip()
+            distance_field   = self._param_vars["distance_field"].get().strip()
+            z_field          = self._param_vars["z_field"].get().strip()
         except ValueError as e:
             messagebox.showerror("Error", f"Invalid parameter: {e}")
             return
 
-        bearing_mode = self._bearing_mode.get()
+        bearing_mode  = self._bearing_mode.get()
         distance_mode = self._distance_mode.get()
         distance_unit = self._distance_unit.get()
 
@@ -442,17 +438,17 @@ class App(tk.Tk):
                 )
                 self._log_write_safe(f"Loaded {len(profile)} points.")
                 self._log_write_safe(
-                    f"Search from ({start_lat:.6f}, {start_lon:.6f}), radius={search_radius} m, "
-                    f"fallback_step={step_m} m, perp_step={coarse_grid} m..."
+                    f"Approx last point: ({approx_last_lat:.6f}, {approx_last_lon:.6f}), "
+                    f"radius={search_radius} m, cone=±{bearing_cone}°, grid={coarse_grid} m..."
                 )
 
                 result = run_search(
                     dsm_path=dsm,
                     profile=profile,
-                    start_lon=start_lon,
-                    start_lat=start_lat,
+                    approx_last_lon=approx_last_lon,
+                    approx_last_lat=approx_last_lat,
                     search_radius_m=search_radius,
-                    step_m=step_m,
+                    bearing_cone_deg=bearing_cone,
                     coarse_grid_m=coarse_grid,
                     smooth_window=smooth_window,
                     progress_cb=lambda v: self.after(0, self._progress_set, v),
@@ -487,10 +483,9 @@ class App(tk.Tk):
         self._progress["value"] = 100
         self._log_write("-" * 60)
         self._log_write("RESULT:")
-        self._log_write(f"  Start:         Lon={result.start_lon:.8f}  Lat={result.start_lat:.8f}")
-        self._log_write(f"  Base bearing:  {result.bearing:.4f}")
-        self._log_write(f"  Perp offset:   {result.perp_offset_m:.3f} m")
-        self._log_write(f"  Along shift:   {result.best_shift_points} pts")
+        self._log_write(f"  First point:   Lon={result.start_lon:.8f}  Lat={result.start_lat:.8f}")
+        self._log_write(f"  Last point:    Lon={result.last_lon:.8f}  Lat={result.last_lat:.8f}")
+        self._log_write(f"  Offset from approx: {result.perp_offset_m:.2f} m")
         self._log_write(f"  RMSE:          {result.rmse:.4f} m")
         self._log_write(f"  MAE:           {result.mae:.4f} m")
         self._log_write(f"  Pearson:       {result.corr:.4f}")
