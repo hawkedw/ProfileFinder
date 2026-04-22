@@ -19,8 +19,7 @@ LINE_FC  = arcpy.GetParameterAsText(0)
 INTERVAL = float(arcpy.GetParameter(1))
 JITTER   = float(arcpy.GetParameter(2))
 DSM_PATH = arcpy.GetParameterAsText(3)
-_error_z_raw = arcpy.GetParameterAsText(4)
-ERROR_Z  = float(_error_z_raw) if _error_z_raw not in ("", None) else 0.0
+ERROR_Z  = float(arcpy.GetParameter(4)) if arcpy.GetParameterAsText(4) not in ("", "#") else 0.0
 OUT_FC   = arcpy.GetParameterAsText(5)
 OUT_CSV  = arcpy.GetParameterAsText(6)
 
@@ -87,7 +86,7 @@ with da.SearchCursor(LINE_FC, search_fields) as s_cur:
             if total_length <= 0:
                 continue
 
-            # Масштаб: метры → единицы SR линии
+            # Масштаб: метры -> единицы SR линии
             total_length_map = geom.length
             scale = total_length_map / total_length
 
@@ -117,6 +116,7 @@ with da.SearchCursor(LINE_FC, search_fields) as s_cur:
                     bear_prev = round(geodesic_bearing(prev_pt, pt_wgs), 4)
 
                 z_raw = sample_dsm(pt_wgs)
+
                 if z_raw is not None and ERROR_Z > 0:
                     z_dsm = round(z_raw + random.uniform(-ERROR_Z, ERROR_Z), 4)
                 else:
