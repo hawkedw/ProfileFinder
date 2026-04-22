@@ -1,16 +1,16 @@
 """
-core.py — ProfileFinder: profile matching for variable bearing/distance chains.
+core.py — ProfileFinder: anchor-last-point search algorithm.
 
-Supports:
-- constant or per-row bearing values
-- constant or per-row distances
-- distance units in meters or degrees
-- approximate start point search with perpendicular offset and start-point shift
-
-Optimisation: uniform segments (same bearing + step) are built with a single
-Geod.fwd call + numpy linspace, matching the speed of the old fixed-step version.
-Variable segments fall back to point-by-point Geod. The outer search loop over
-(perp_offset, along_shift) is vectorised with numpy where possible.
+Algorithm:
+1. The approximate coordinate corresponds to the LAST point of the profile.
+2. Candidate positions for the last point are searched within `search_radius_m`
+   from the approximate coordinate, restricted to a bearing cone defined by
+   the last point's BEAR_PREV ± bearing_cone_deg.
+3. For each candidate last point, the chain is built BACKWARDS using each
+   point's BEAR_PREV (reversed by +180°) and DIST_PREV.
+4. DSM heights are sampled at every reconstructed position and compared to
+   Z_DSM values (with a configurable Z tolerance for noisy measurements).
+5. The candidate with the best RMSE/correlation score is returned.
 """
 
 import csv
@@ -27,40 +27,29 @@ from rasterio.transform import rowcol
 _GEOD = Geod(ellps="WGS84")
 _METERS_PER_DEGREE = 111320.0
 
-# Tolerances for "uniform" segment detection
-_BEARING_TOL = 0.001   # degrees
-_DIST_TOL_REL = 0.001  # 0.1 % relative
-
 
 @dataclass
 class ProfilePoint:
-    bearing: float
-    z_dsm: float
-    distance_value: float = 0.0
-    distance_unit: str = "m"
-
-    @property
-    def distance_m(self) -> float:
-        if (self.distance_unit or "m").lower().startswith("deg"):
-            return float(self.distance_value) * _METERS_PER_DEGREE
-        return float(self.distance_value)
+    bear_prev: float      # bearing FROM previous point TO this point (deg)
+    dist_prev_m: float    # distance from previous point (meters)
+    z_dsm: float          # reference Z height (possibly noisy)
 
 
 @dataclass
 class SearchResult:
-    start_lon: float
-    start_lat: float
-    step_m: float
+    start_lon: float      # lon of first (index 0) point
+    start_lat: float      # lat of first (index 0) point
+    last_lon: float       # lon of last point (the anchored one)
+    last_lat: float       # lat of last point
     rmse: float
     mae: float
     corr: float
     matched: int
-    points: List[Tuple[float, float]] = field(default_factory=list)
+    points: List[Tuple[float, float]] = field(default_factory=list)  # (lon, lat) for each point
     profile: List[ProfilePoint] = field(default_factory=list)
     z_sampled: List[float] = field(default_factory=list)
-    best_shift_points: int = 0
-    bearing: float = 0.0
     perp_offset_m: float = 0.0
+    bearing_offset_deg: float = 0.0
 
 
 @dataclass
@@ -117,11 +106,11 @@ def _parse_float(value, field_name: str) -> float:
 def load_profile(
     path: str,
     bearing_mode: str = "field",
-    bearing_field: str = "Bearing",
+    bearing_field: str = "BEAR_PREV",
     bearing_const: float = 0.0,
     z_field: str = "Z_DSM",
-    distance_mode: str = "const",
-    distance_field: str = "Distance",
+    distance_mode: str = "field",
+    distance_field: str = "DIST_PREV",
     distance_const: float = 5.0,
     distance_unit: str = "m",
 ) -> List[ProfilePoint]:
@@ -143,28 +132,34 @@ def load_profile(
         points: List[ProfilePoint] = []
         for row in reader:
             row = {(k.strip() if k else k): (v.strip() if isinstance(v, str) else v) for k, v in row.items()}
+
             if z_field not in row:
                 raise KeyError(f"Column '{z_field}' not found. Available: {list(row.keys())}")
 
             if (bearing_mode or "field") == "field":
                 if bearing_field not in row:
                     raise KeyError(f"Column '{bearing_field}' not found. Available: {list(row.keys())}")
-                bearing = _parse_float(row[bearing_field], bearing_field)
+                bear = _parse_float(row[bearing_field], bearing_field)
             else:
-                bearing = float(bearing_const)
+                bear = float(bearing_const)
 
-            if (distance_mode or "const") == "field":
+            if (distance_mode or "field") == "field":
                 if distance_field not in row:
                     raise KeyError(f"Column '{distance_field}' not found. Available: {list(row.keys())}")
-                distance_value = _parse_float(row[distance_field], distance_field)
+                dist_val = _parse_float(row[distance_field], distance_field)
             else:
-                distance_value = float(distance_const)
+                dist_val = float(distance_const)
+
+            # convert distance to meters if needed
+            if (distance_unit or "m").lower().startswith("deg"):
+                dist_m = dist_val * _METERS_PER_DEGREE
+            else:
+                dist_m = dist_val
 
             points.append(ProfilePoint(
-                bearing=float(bearing),
+                bear_prev=float(bear),
+                dist_prev_m=float(dist_m),
                 z_dsm=_parse_float(row[z_field], z_field),
-                distance_value=float(distance_value),
-                distance_unit=distance_unit,
             ))
 
     if not points:
@@ -173,77 +168,34 @@ def load_profile(
 
 
 # ---------------------------------------------------------------------------
-# Segment detection
+# Chain building (backwards from last point)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class _Segment:
-    """A run of consecutive profile steps with the same bearing and distance."""
-    start_idx: int   # index of first point in this segment
-    count: int       # number of points belonging to this segment
-    bearing: float
-    dist_m: float
-    uniform: bool    # True → fast path; False → point-by-point Geod
+def build_chain_backwards(
+    last_lon: float,
+    last_lat: float,
+    profile: List[ProfilePoint],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Reconstruct all point coordinates starting from the last point,
+    walking backwards using reversed bearings and distances.
 
-
-def _detect_segments(profile: List[ProfilePoint]) -> List[_Segment]:
-    """Split profile into uniform runs (same bearing + distance within tolerance)."""
-    if not profile:
-        return []
-
-    segments: List[_Segment] = []
-    seg_start = 0
-    ref_bearing = profile[0].bearing
-    ref_dist = max(profile[0].distance_m, 1e-9)
-
-    def _flush(end_idx: int):
-        n = end_idx - seg_start
-        if n <= 0:
-            return
-        # a segment with count=n covers points [seg_start .. seg_start+n-1]
-        # the last step that *moves* is from point n-2 to n-1
-        segments.append(_Segment(
-            start_idx=seg_start,
-            count=n,
-            bearing=ref_bearing,
-            dist_m=ref_dist,
-            uniform=True,
-        ))
-
-    for i in range(1, len(profile)):
-        b = profile[i].bearing
-        d = max(profile[i].distance_m, 1e-9)
-        same_bearing = abs(b - ref_bearing) <= _BEARING_TOL
-        same_dist = abs(d - ref_dist) / ref_dist <= _DIST_TOL_REL
-        if not (same_bearing and same_dist):
-            _flush(i)
-            seg_start = i
-            ref_bearing = b
-            ref_dist = d
-
-    _flush(len(profile))
-    return segments
-
-
-# ---------------------------------------------------------------------------
-# Chain building  (fast path for uniform segments)
-# ---------------------------------------------------------------------------
-
-def build_chain(start_lon: float, start_lat: float, profile: List[ProfilePoint]) -> Tuple[np.ndarray, np.ndarray]:
+    Returns lons, lats arrays indexed [0..N-1] where index 0 = first profile point.
+    """
     n = len(profile)
-    if n == 0:
-        return np.empty(0), np.empty(0)
-
     lons = np.empty(n, dtype=np.float64)
     lats = np.empty(n, dtype=np.float64)
-    lons[0] = float(start_lon)
-    lats[0] = float(start_lat)
+    lons[n - 1] = float(last_lon)
+    lats[n - 1] = float(last_lat)
 
-    for i in range(1, n):
-        prev = profile[i - 1]
-        lon2, lat2, _ = _GEOD.fwd(lons[i - 1], lats[i - 1], prev.bearing, prev.distance_m)
-        lons[i] = lon2
-        lats[i] = lat2
+    for i in range(n - 1, 0, -1):
+        # profile[i].bear_prev is the bearing FROM point[i-1] TO point[i]
+        # Reverse it to walk from point[i] back to point[i-1]
+        reverse_bearing = (profile[i].bear_prev + 180.0) % 360.0
+        dist_m = max(0.001, profile[i].dist_prev_m)
+        lon_prev, lat_prev, _ = _GEOD.fwd(lons[i], lats[i], reverse_bearing, dist_m)
+        lons[i - 1] = lon_prev
+        lats[i - 1] = lat_prev
 
     return lons, lats
 
@@ -285,51 +237,52 @@ def score(rmse: float, corr: float, mae: float) -> float:
     return rmse * (1.0 + penalty) + 0.1 * mae
 
 
-def shift_origin(lon: float, lat: float, azimuth_deg: float, dist_m: float) -> Tuple[float, float]:
-    lon2, lat2, _ = _GEOD.fwd(lon, lat, azimuth_deg, dist_m)
-    return float(lon2), float(lat2)
-
-
-def shift_profile_start(profile: List[ProfilePoint], shift_pts: int) -> List[ProfilePoint]:
-    n = len(profile)
-    if n == 0 or shift_pts == 0:
-        return list(profile)
-    if shift_pts > 0:
-        if shift_pts >= n:
-            shift_pts = n - 1
-        return [profile[min(i + shift_pts, n - 1)] for i in range(n)]
-    k = abs(shift_pts)
-    if k >= n:
-        k = n - 1
-    prefix = [profile[0] for _ in range(k)]
-    return prefix + [profile[i - k] for i in range(k, n)]
+def _bearing_diff(a: float, b: float) -> float:
+    """Smallest signed difference between two bearings (degrees), result in [-180, 180]."""
+    d = (a - b + 180.0) % 360.0 - 180.0
+    return float(d)
 
 
 # ---------------------------------------------------------------------------
-# Candidate evaluation
+# Candidate grid generation (polar around approximate last point)
 # ---------------------------------------------------------------------------
 
-def evaluate_candidate(
-    cache: DsmCache,
-    ref_z: np.ndarray,
+def _generate_candidates(
     approx_lon: float,
     approx_lat: float,
-    base_bearing: float,
-    profile: List[ProfilePoint],
-    perp_offset_m: float,
-    along_shift_pts: int,
-    smooth_window: int,
-) -> Tuple[float, float, float, float, int, np.ndarray, Tuple[float, float], np.ndarray, np.ndarray]:
-    cand_start_lon, cand_start_lat = shift_origin(approx_lon, approx_lat, base_bearing + 90.0, perp_offset_m)
-
-    shifted_profile = shift_profile_start(profile, along_shift_pts)
-    lons, lats = build_chain(cand_start_lon, cand_start_lat, shifted_profile)
-    sampled = sample_cache(cache, lons, lats)
-    sampled_eval = smooth(sampled, smooth_window) if smooth_window > 1 else sampled.copy()
-
-    rmse, mae, corr, matched = compute_metrics(ref_z, sampled_eval)
-    s = score(rmse, corr, mae)
-    return s, rmse, mae, corr, matched, sampled, (cand_start_lon, cand_start_lat), lons, lats
+    last_bear_prev: float,
+    search_radius_m: float,
+    grid_step_m: float,
+    bearing_cone_deg: float,
+) -> List[Tuple[float, float]]:
+    """
+    Generate a grid of candidate positions for the last point.
+    Candidates are within search_radius_m of the approximate coordinate AND
+    within ±bearing_cone_deg of last_bear_prev (the bearing the last step arrives from).
+    """
+    candidates = []
+    steps = max(1, int(math.ceil(search_radius_m / grid_step_m)))
+    for di in range(-steps, steps + 1):
+        for dj in range(-steps, steps + 1):
+            dist = math.sqrt(di ** 2 + dj ** 2) * grid_step_m
+            if dist > search_radius_m:
+                continue
+            if dist < 1e-6:
+                candidates.append((approx_lon, approx_lat))
+                continue
+            # Cartesian offset → bearing
+            bearing_to = math.degrees(math.atan2(dj, di))  # East=0 convention
+            # Convert to North=0 bearing
+            bearing_to = (90.0 - bearing_to) % 360.0
+            # Filter by cone: we want candidates reachable from the direction
+            # the last segment arrives, so the candidate should lie roughly
+            # along last_bear_prev from the previous point — equivalently the
+            # displacement from approx coord to candidate should be within cone.
+            if abs(_bearing_diff(bearing_to, last_bear_prev)) > bearing_cone_deg:
+                continue
+            lon2, lat2, _ = _GEOD.fwd(approx_lon, approx_lat, bearing_to, dist)
+            candidates.append((float(lon2), float(lat2)))
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -339,20 +292,22 @@ def evaluate_candidate(
 def run_search(
     dsm_path: str,
     profile: List[ProfilePoint],
-    start_lon: float,
-    start_lat: float,
+    approx_last_lon: float,
+    approx_last_lat: float,
     search_radius_m: float,
-    step_m: float,
     coarse_grid_m: float = 25.0,
+    bearing_cone_deg: float = 45.0,
     smooth_window: int = 1,
-    top_k: int = 1,
     refine_iterations: int = 2,
-    refine_xy_radius_m: float = 0.0,
-    refine_xy_step_m: float = 0.0,
     band: int = 1,
     progress_cb: Optional[Callable] = None,
     stop_event: Optional[threading.Event] = None,
     log_cb: Optional[Callable] = None,
+    # kept for API compatibility but unused in new algorithm
+    step_m: float = 5.0,
+    top_k: int = 1,
+    refine_xy_radius_m: float = 0.0,
+    refine_xy_step_m: float = 0.0,
 ) -> SearchResult:
     if not profile:
         raise ValueError("Profile is empty")
@@ -360,16 +315,7 @@ def run_search(
     ref_z_raw = np.asarray([p.z_dsm for p in profile], dtype=np.float64)
     ref_z = smooth(ref_z_raw, smooth_window) if smooth_window > 1 else ref_z_raw.copy()
 
-    base_bearing = float(profile[0].bearing)
-    mean_step_m = float(np.mean([max(0.001, p.distance_m) for p in profile[:-1]])) if len(profile) > 1 else float(step_m)
-    max_along_shift_pts = max(1, int(round(search_radius_m / max(mean_step_m, 0.001))))
-    coarse_step = max(1.0, coarse_grid_m)
-    offsets = np.arange(-search_radius_m, search_radius_m + coarse_step * 0.5, coarse_step, dtype=np.float64)
-    shifts = np.arange(-max_along_shift_pts, max_along_shift_pts + 1, 1, dtype=np.int32)
-
-    # Detect whether the whole profile is uniform (same bearing + step)
-    segments = _detect_segments(profile)
-    is_uniform = len(segments) == 1 and segments[0].uniform
+    last_bear_prev = profile[-1].bear_prev  # bearing of last segment (prev→last)
 
     with rasterio.open(dsm_path) as src:
         if log_cb:
@@ -377,143 +323,143 @@ def run_search(
         cache = load_dsm_cache(src, band)
 
     if log_cb:
-        mode_label = "uniform (fast)" if is_uniform else f"variable ({len(segments)} segments)"
         log_cb(
-            f"Chain mode: {mode_label}. Points={len(profile)}, base bearing={base_bearing:.4f}°, "
-            f"mean step={mean_step_m:.3f} m"
+            f"Anchor-last-point search. Points={len(profile)}, "
+            f"last BEAR_PREV={last_bear_prev:.2f}°, cone=±{bearing_cone_deg}°, "
+            f"radius={search_radius_m:.0f} m, grid={coarse_grid_m:.0f} m"
         )
-        log_cb(f"Perpendicular search: {len(offsets)} candidates × ±{max_along_shift_pts} shifts")
 
-    best = None
-    total = max(1, len(offsets) * len(shifts) + refine_iterations * 20)
+    # --- coarse search ---
+    candidates = _generate_candidates(
+        approx_lon=approx_last_lon,
+        approx_lat=approx_last_lat,
+        last_bear_prev=last_bear_prev,
+        search_radius_m=search_radius_m,
+        grid_step_m=coarse_grid_m,
+        bearing_cone_deg=bearing_cone_deg,
+    )
+
+    if log_cb:
+        log_cb(f"Candidates (coarse): {len(candidates)}")
+
+    total = max(1, len(candidates) + refine_iterations * 20)
     done = 0
 
     def report_progress():
         if progress_cb:
             progress_cb(min(0.999, done / total))
 
-    for perp_offset_m in offsets:
+    best = None
+
+    for cand_lon, cand_lat in candidates:
         if stop_event and stop_event.is_set():
             break
-        for shift_pts in shifts:
-            if stop_event and stop_event.is_set():
-                break
-            s, rmse, mae, corr, matched, sampled_raw, final_start, lons, lats = evaluate_candidate(
-                cache=cache,
-                ref_z=ref_z,
-                approx_lon=start_lon,
-                approx_lat=start_lat,
-                base_bearing=base_bearing,
-                profile=profile,
-                perp_offset_m=float(perp_offset_m),
-                along_shift_pts=int(shift_pts),
-                smooth_window=smooth_window,
-            )
-            current = {
-                "score": s,
-                "rmse": rmse,
-                "mae": mae,
-                "corr": corr,
-                "matched": matched,
-                "shift_pts": int(shift_pts),
-                "perp_offset_m": float(perp_offset_m),
-                "start_lon": final_start[0],
-                "start_lat": final_start[1],
-                "lons": lons,
-                "lats": lats,
-                "sampled_raw": sampled_raw,
-            }
-            if best is None or current["score"] < best["score"]:
-                best = current
-                if log_cb:
-                    log_cb(
-                        f"  coarse best: perp={best['perp_offset_m']:.1f} m, "
-                        f"shift={best['shift_pts']} pts, RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
-                    )
-            done += 1
-            report_progress()
+
+        lons, lats = build_chain_backwards(cand_lon, cand_lat, profile)
+        sampled = sample_cache(cache, lons, lats)
+        sampled_eval = smooth(sampled, smooth_window) if smooth_window > 1 else sampled.copy()
+        rmse, mae, corr, matched = compute_metrics(ref_z, sampled_eval)
+        s = score(rmse, corr, mae)
+
+        current = {
+            "score": s, "rmse": rmse, "mae": mae, "corr": corr,
+            "matched": matched,
+            "last_lon": cand_lon, "last_lat": cand_lat,
+            "lons": lons, "lats": lats,
+            "sampled": sampled,
+        }
+        if best is None or s < best["score"]:
+            best = current
+            if log_cb:
+                log_cb(
+                    f"  coarse best: last=({cand_lat:.7f}, {cand_lon:.7f}), "
+                    f"RMSE={rmse:.4f}, corr={corr:.4f}"
+                )
+        done += 1
+        report_progress()
 
     if best is None:
         raise RuntimeError("No valid candidates found in search area.")
 
     # --- refinement ---
-    refine_step = max(1.0, coarse_step / 5.0)
-    refine_radius = max(refine_step * 2, coarse_step)
+    refine_step = max(1.0, coarse_grid_m / 5.0)
+    refine_radius = max(refine_step * 2, coarse_grid_m)
+
     for it in range(refine_iterations):
         if stop_event and stop_event.is_set():
             break
-        local_offsets = np.arange(
-            best["perp_offset_m"] - refine_radius,
-            best["perp_offset_m"] + refine_radius + refine_step * 0.5,
-            refine_step,
-            dtype=np.float64,
+
+        local_candidates = _generate_candidates(
+            approx_lon=best["last_lon"],
+            approx_lat=best["last_lat"],
+            last_bear_prev=last_bear_prev,
+            search_radius_m=refine_radius,
+            grid_step_m=refine_step,
+            bearing_cone_deg=bearing_cone_deg,
         )
-        local_shifts = np.arange(best["shift_pts"] - 2, best["shift_pts"] + 3, 1, dtype=np.int32)
+
         improved = False
-        for perp_offset_m in local_offsets:
+        for cand_lon, cand_lat in local_candidates:
             if stop_event and stop_event.is_set():
                 break
-            for shift_pts in local_shifts:
-                if stop_event and stop_event.is_set():
-                    break
-                s, rmse, mae, corr, matched, sampled_raw, final_start, lons, lats = evaluate_candidate(
-                    cache=cache,
-                    ref_z=ref_z,
-                    approx_lon=start_lon,
-                    approx_lat=start_lat,
-                    base_bearing=base_bearing,
-                    profile=profile,
-                    perp_offset_m=float(perp_offset_m),
-                    along_shift_pts=int(shift_pts),
-                    smooth_window=smooth_window,
-                )
-                if s < best["score"]:
-                    best = {
-                        "score": s, "rmse": rmse, "mae": mae, "corr": corr,
-                        "matched": matched, "shift_pts": int(shift_pts),
-                        "perp_offset_m": float(perp_offset_m),
-                        "start_lon": final_start[0], "start_lat": final_start[1],
-                        "lons": lons, "lats": lats, "sampled_raw": sampled_raw,
-                    }
-                    improved = True
+            lons, lats = build_chain_backwards(cand_lon, cand_lat, profile)
+            sampled = sample_cache(cache, lons, lats)
+            sampled_eval = smooth(sampled, smooth_window) if smooth_window > 1 else sampled.copy()
+            rmse, mae, corr, matched = compute_metrics(ref_z, sampled_eval)
+            s = score(rmse, corr, mae)
+            if s < best["score"]:
+                best = {
+                    "score": s, "rmse": rmse, "mae": mae, "corr": corr,
+                    "matched": matched,
+                    "last_lon": cand_lon, "last_lat": cand_lat,
+                    "lons": lons, "lats": lats,
+                    "sampled": sampled,
+                }
+                improved = True
+
         refine_radius = max(refine_step * 2, refine_radius / 2.0)
-        refine_step = max(1.0, refine_step / 2.0)
+        refine_step = max(0.5, refine_step / 2.0)
+
         if log_cb:
             log_cb(
-                f"  refine {it + 1}: perp={best['perp_offset_m']:.2f} m, "
-                f"shift={best['shift_pts']} pts, RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
+                f"  refine {it + 1}: last=({best['last_lat']:.8f}, {best['last_lon']:.8f}), "
+                f"RMSE={best['rmse']:.4f}, corr={best['corr']:.4f}"
             )
         done += 20
         report_progress()
-        if not improved and refine_step <= 1.0:
+        if not improved and refine_step <= 0.5:
             break
 
-    final_profile = shift_profile_start(profile, int(best["shift_pts"]))
-    final_lons, final_lats = build_chain(best["start_lon"], best["start_lat"], final_profile)
+    # --- final pass with best last point ---
+    final_lons, final_lats = build_chain_backwards(best["last_lon"], best["last_lat"], profile)
     final_sampled = sample_cache(cache, final_lons, final_lats)
     rmse, mae, corr, matched = compute_metrics(ref_z_raw, final_sampled)
 
+    # Compute displacement of best last point from approx coordinate
+    _, _, dist_offset = _GEOD.inv(approx_last_lon, approx_last_lat, best["last_lon"], best["last_lat"])
+    bear_offset, _, _ = _GEOD.inv(approx_last_lon, approx_last_lat, best["last_lon"], best["last_lat"])
+
     if log_cb:
         log_cb(
-            f"Final: start=({best['start_lat']:.8f}, {best['start_lon']:.8f}), "
-            f"perp={best['perp_offset_m']:.2f} m, shift={best['shift_pts']} pts, "
+            f"Final: last=({best['last_lat']:.8f}, {best['last_lon']:.8f}), "
+            f"offset={dist_offset:.2f} m, "
             f"RMSE={rmse:.4f}, corr={corr:.4f}, matched={matched}/{len(profile)}"
         )
     if progress_cb:
         progress_cb(1.0)
 
     return SearchResult(
-        start_lon=float(best["start_lon"]),
-        start_lat=float(best["start_lat"]),
-        step_m=float(mean_step_m if math.isfinite(mean_step_m) else step_m),
+        start_lon=float(final_lons[0]),
+        start_lat=float(final_lats[0]),
+        last_lon=float(best["last_lon"]),
+        last_lat=float(best["last_lat"]),
         rmse=rmse,
         mae=mae,
         corr=corr,
         matched=matched,
         points=list(zip(final_lons.tolist(), final_lats.tolist())),
-        profile=final_profile,
+        profile=list(profile),
         z_sampled=final_sampled.tolist(),
-        best_shift_points=int(best["shift_pts"]),
-        bearing=float(base_bearing),
-        perp_offset_m=float(best["perp_offset_m"]),
+        perp_offset_m=float(dist_offset),
+        bearing_offset_deg=float(bear_offset),
     )
