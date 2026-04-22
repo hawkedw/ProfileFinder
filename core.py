@@ -257,31 +257,38 @@ def _generate_candidates(
 ) -> List[Tuple[float, float]]:
     """
     Generate a grid of candidate positions for the last point.
-    Candidates are within search_radius_m of the approximate coordinate AND
-    within ±bearing_cone_deg of last_bear_prev (the bearing the last step arrives from).
+
+    For each grid cell offset (north_m, east_m) within search_radius_m:
+      - compute the true geodetic bearing from approx coord to the candidate
+        using atan2(east_m, north_m) — North=0, East=90 convention
+      - keep the candidate only if that bearing is within ±bearing_cone_deg
+        of last_bear_prev (the bearing of the last profile segment)
     """
     candidates = []
     steps = max(1, int(math.ceil(search_radius_m / grid_step_m)))
-    for di in range(-steps, steps + 1):
-        for dj in range(-steps, steps + 1):
-            dist = math.sqrt(di ** 2 + dj ** 2) * grid_step_m
+
+    for di in range(-steps, steps + 1):        # di > 0 = north
+        for dj in range(-steps, steps + 1):    # dj > 0 = east
+            north_m = di * grid_step_m
+            east_m  = dj * grid_step_m
+            dist = math.sqrt(north_m ** 2 + east_m ** 2)
+
             if dist > search_radius_m:
                 continue
+
             if dist < 1e-6:
                 candidates.append((approx_lon, approx_lat))
                 continue
-            # Cartesian offset → bearing
-            bearing_to = math.degrees(math.atan2(dj, di))  # East=0 convention
-            # Convert to North=0 bearing
-            bearing_to = (90.0 - bearing_to) % 360.0
-            # Filter by cone: we want candidates reachable from the direction
-            # the last segment arrives, so the candidate should lie roughly
-            # along last_bear_prev from the previous point — equivalently the
-            # displacement from approx coord to candidate should be within cone.
+
+            # North=0, East=90 bearing — correct geodetic convention
+            bearing_to = math.degrees(math.atan2(east_m, north_m)) % 360.0
+
             if abs(_bearing_diff(bearing_to, last_bear_prev)) > bearing_cone_deg:
                 continue
+
             lon2, lat2, _ = _GEOD.fwd(approx_lon, approx_lat, bearing_to, dist)
             candidates.append((float(lon2), float(lat2)))
+
     return candidates
 
 
