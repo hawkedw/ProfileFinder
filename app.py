@@ -25,10 +25,10 @@ DEFAULT_PARAMS = {
     "smooth_window": "1",
     "bearing_mode": "field",
     "bearing_const": "0",
-    "bearing_field": "Bearing",
-    "distance_mode": "const",
+    "bearing_field": "BEAR_PREV",
+    "distance_mode": "field",
     "distance_const": "5",
-    "distance_field": "Distance",
+    "distance_field": "DIST_PREV",
     "distance_unit": "m",
     "z_field": "Z_DSM",
 }
@@ -136,7 +136,6 @@ def read_csv_columns(path: str) -> list:
         reader = csv.reader(f, dialect=dialect)
         try:
             row = next(reader)
-            # если снифер не справился и вернул одно поле с разделителями внутри — пробуем ещё раз
             if len(row) == 1:
                 for sep in (";", "\t", "|", ","):
                     parts = row[0].split(sep)
@@ -183,17 +182,17 @@ class App(tk.Tk):
         frame_params.grid(row=1, column=0, sticky="ew", **pad)
 
         self._param_vars = {
-            "start_lon": tk.StringVar(value="0.0"),
-            "start_lat": tk.StringVar(value="0.0"),
-            "search_radius": tk.StringVar(value="5000"),
-            "step_m": tk.StringVar(value="5"),
-            "coarse_grid": tk.StringVar(value="25"),
-            "smooth_window": tk.StringVar(value="1"),
-            "bearing_const": tk.StringVar(value="0"),
-            "bearing_field": tk.StringVar(value="Bearing"),
-            "distance_const": tk.StringVar(value="5"),
-            "distance_field": tk.StringVar(value="Distance"),
-            "z_field": tk.StringVar(value="Z_DSM"),
+            "start_lon":      tk.StringVar(value=DEFAULT_PARAMS["start_lon"]),
+            "start_lat":      tk.StringVar(value=DEFAULT_PARAMS["start_lat"]),
+            "search_radius":  tk.StringVar(value=DEFAULT_PARAMS["search_radius"]),
+            "step_m":         tk.StringVar(value=DEFAULT_PARAMS["step_m"]),
+            "coarse_grid":    tk.StringVar(value=DEFAULT_PARAMS["coarse_grid"]),
+            "smooth_window":  tk.StringVar(value=DEFAULT_PARAMS["smooth_window"]),
+            "bearing_const":  tk.StringVar(value=DEFAULT_PARAMS["bearing_const"]),
+            "bearing_field":  tk.StringVar(value=DEFAULT_PARAMS["bearing_field"]),
+            "distance_const": tk.StringVar(value=DEFAULT_PARAMS["distance_const"]),
+            "distance_field": tk.StringVar(value=DEFAULT_PARAMS["distance_field"]),
+            "z_field":        tk.StringVar(value=DEFAULT_PARAMS["z_field"]),
         }
 
         ttk.Label(frame_params, text="Start Longitude (°):").grid(row=0, column=0, sticky="w", **pad)
@@ -220,7 +219,7 @@ class App(tk.Tk):
 
         frame_bearing = ttk.LabelFrame(frame_params, text="Bearing source")
         frame_bearing.grid(row=0, column=2, rowspan=3, sticky="nw", padx=12, pady=4)
-        self._bearing_mode = tk.StringVar(value="field")
+        self._bearing_mode = tk.StringVar(value=DEFAULT_PARAMS["bearing_mode"])
         ttk.Radiobutton(frame_bearing, text="CSV column", value="field", variable=self._bearing_mode, command=self._update_mode_state).grid(row=0, column=0, sticky="w", **pad)
         ttk.Radiobutton(frame_bearing, text="Constant", value="const", variable=self._bearing_mode, command=self._update_mode_state).grid(row=1, column=0, sticky="w", **pad)
         ttk.Label(frame_bearing, text="Column:").grid(row=2, column=0, sticky="w", **pad)
@@ -232,7 +231,7 @@ class App(tk.Tk):
 
         frame_distance = ttk.LabelFrame(frame_params, text="Distance source")
         frame_distance.grid(row=3, column=2, rowspan=4, sticky="nw", padx=12, pady=4)
-        self._distance_mode = tk.StringVar(value="const")
+        self._distance_mode = tk.StringVar(value=DEFAULT_PARAMS["distance_mode"])
         ttk.Radiobutton(frame_distance, text="CSV column", value="field", variable=self._distance_mode, command=self._update_mode_state).grid(row=0, column=0, sticky="w", **pad)
         ttk.Radiobutton(frame_distance, text="Constant", value="const", variable=self._distance_mode, command=self._update_mode_state).grid(row=1, column=0, sticky="w", **pad)
         ttk.Label(frame_distance, text="Column:").grid(row=2, column=0, sticky="w", **pad)
@@ -242,7 +241,7 @@ class App(tk.Tk):
         self._distance_const_entry = ttk.Entry(frame_distance, textvariable=self._param_vars["distance_const"], width=24)
         self._distance_const_entry.grid(row=5, column=0, sticky="w", **pad)
         ttk.Label(frame_distance, text="Unit:").grid(row=6, column=0, sticky="w", **pad)
-        self._distance_unit = tk.StringVar(value="m")
+        self._distance_unit = tk.StringVar(value=DEFAULT_PARAMS["distance_unit"])
         self._distance_unit_combo = ttk.Combobox(frame_distance, textvariable=self._distance_unit, values=["m", "deg"], width=8, state="readonly")
         self._distance_unit_combo.grid(row=7, column=0, sticky="w", **pad)
 
@@ -289,8 +288,8 @@ class App(tk.Tk):
                     data = json.load(f)
             except Exception:
                 data = {}
-        self._dsm_var.set(data.get("dsm", ""))
-        self._csv_var.set(data.get("csv", ""))
+        self._dsm_var.set(data.get("dsm", DEFAULT_PARAMS["dsm"]))
+        self._csv_var.set(data.get("csv", DEFAULT_PARAMS["csv"]))
         for key, var in self._param_vars.items():
             var.set(data.get(key, DEFAULT_PARAMS.get(key, var.get())))
         self._bearing_mode.set(data.get("bearing_mode", DEFAULT_PARAMS["bearing_mode"]))
@@ -329,12 +328,18 @@ class App(tk.Tk):
         if cols:
             self._log_write(f"CSV columns detected: {cols}")
             lower_map = {c.strip().lower(): c for c in cols}
-            if "bearing" in lower_map:
-                self._param_vars["bearing_field"].set(lower_map["bearing"])
+            # авто-выбор: BEAR_PREV приоритетнее BEARING
+            for candidate in ("bear_prev", "bearing"):
+                if candidate in lower_map:
+                    self._param_vars["bearing_field"].set(lower_map[candidate])
+                    break
+            # авто-выбор: DIST_PREV приоритетнее DISTANCE
+            for candidate in ("dist_prev", "distance"):
+                if candidate in lower_map:
+                    self._param_vars["distance_field"].set(lower_map[candidate])
+                    break
             if "z_dsm" in lower_map:
                 self._param_vars["z_field"].set(lower_map["z_dsm"])
-            if "distance" in lower_map:
-                self._param_vars["distance_field"].set(lower_map["distance"])
 
     def _browse_csv(self):
         path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])

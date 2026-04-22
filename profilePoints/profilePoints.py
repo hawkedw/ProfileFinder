@@ -11,15 +11,17 @@ import math
 # 1  Interval  Double         Input   Required   default: 5
 # 2  Error     Double         Input   Required   default: 0
 # 3  DSM       Raster Layer   Input   Required
-# 4  Points    Feature Class  Output  Derived
-# 5  CSV       File           Output  Optional
+# 4  Error_Z   Double         Input   Optional   default: 0
+# 5  Points    Feature Class  Output  Derived
+# 6  CSV       File           Output  Optional
 # ============================================================
 LINE_FC  = arcpy.GetParameterAsText(0)
 INTERVAL = float(arcpy.GetParameter(1))
 JITTER   = float(arcpy.GetParameter(2))
 DSM_PATH = arcpy.GetParameterAsText(3)
-OUT_FC   = arcpy.GetParameterAsText(4)
-OUT_CSV  = arcpy.GetParameterAsText(5)
+ERROR_Z  = float(arcpy.GetParameter(4)) if arcpy.GetParameterAsText(4) not in ("", "#") else 0.0
+OUT_FC   = arcpy.GetParameterAsText(5)
+OUT_CSV  = arcpy.GetParameterAsText(6)
 
 SR = arcpy.SpatialReference(4326)
 
@@ -84,7 +86,7 @@ with da.SearchCursor(LINE_FC, search_fields) as s_cur:
             if total_length <= 0:
                 continue
 
-            # Масштаб: метры → единицы SR линии
+            # Масштаб: метры -> единицы SR линии
             total_length_map = geom.length
             scale = total_length_map / total_length
 
@@ -113,7 +115,12 @@ with da.SearchCursor(LINE_FC, search_fields) as s_cur:
                     dist_prev = round(geodesic_dist(prev_pt, pt_wgs), 4)
                     bear_prev = round(geodesic_bearing(prev_pt, pt_wgs), 4)
 
-                z_dsm = sample_dsm(pt_wgs)
+                z_raw = sample_dsm(pt_wgs)
+
+                if z_raw is not None and ERROR_Z > 0:
+                    z_dsm = round(z_raw + random.uniform(-ERROR_Z, ERROR_Z), 4)
+                else:
+                    z_dsm = z_raw
 
                 i_cur.insertRow([pt_wgs, name, idx, dist_prev, bear_prev, z_dsm])
                 csv_rows.append({
@@ -134,5 +141,5 @@ if OUT_CSV:
         writer.writeheader()
         writer.writerows(csv_rows)
 
-arcpy.SetParameter(4, OUT_FC)
+arcpy.SetParameter(5, OUT_FC)
 arcpy.AddMessage(f"Done. Points: {total_pts}")
