@@ -1,51 +1,244 @@
 # ProfileFinder
 
-Standalone GUI tool that searches a DSM raster for a chain of points whose sampled elevation profile best matches an ordered reference profile.
+Инструмент для геопривязки профилей рельефа по ЦМР (цифровой модели рельефа). По табличному набору точек с азимутами, расстояниями и высотами из ЦМР определяет реальное положение профиля на местности методом перебора кандидатных позиций последней точки.
 
-## Input CSV format
+---
 
-| Column | Description |
-|--------|-------------|
-| `Bearing` | Azimuth from the **previous** point to this point (degrees, 0–360) |
-| `Z_DSM` | Reference DSM elevation value at this point (metres) |
+## Принцип работы алгоритма
 
-First row is considered the **starting point** — its `Bearing` value is ignored (only used from row 2 onward).
+Алгоритм реализован в `core.py` и работает по принципу **привязки от последней точки** (anchor-last-point).
 
-## Parameters
+### Исходные данные
 
-| Parameter | Description |
-|-----------|-------------|
-| Start Longitude / Latitude | Approximate WGS84 coordinates of the **first** point |
-| Search radius (m) | Radius around start point to search |
-| Point step (m) | Distance between consecutive points along the chain |
-| Coarse grid (m) | Grid spacing for the initial brute-force search |
-| Smooth window | Moving average window applied to both profiles before comparison |
+Профиль — CSV-файл, где каждая строка соответствует одной точке и содержит:
 
-## Outputs
+| Поле | Описание |
+|---|---|
+| `BEAR_PREV` | Азимут от предыдущей точки к текущей (градусы) |
+| `DIST_PREV` | Расстояние от предыдущей точки (метры или градусы) |
+| `Z_DSM` | Высота точки по ЦМР (метры) |
 
-- **CSV** — `Id, Lon, Lat` for each recovered point (WGS84 decimal degrees)
-- **GeoJSON** — same points as a FeatureCollection
+Имена полей настраиваются. Все три поля могут быть заменены константами.
 
-## Install & run (Python)
+### Шаги алгоритма
+
+**1. Генерация кандидатов (грубая сетка)**
+
+Вокруг приближённой координаты последней точки строится полярная сетка с шагом `coarse_grid_m` в радиусе `search_radius_m`. Каждый узел сетки — кандидат на позицию последней точки. Кандидаты фильтруются по конусу направлений: оставляются только те, чей азимут от приближённой координаты попадает в ±`bearing_cone_deg` от `BEAR_PREV` последней точки профиля.
+
+**2. Восстановление цепочки назад**
+
+Для каждого кандидата функция `build_chain_backwards` восстанавливает координаты всех точек профиля, двигаясь от последней точки назад. Для перехода от точки `i` к точке `i-1` используется обратный азимут (`BEAR_PREV + 180°`) и расстояние `DIST_PREV`. Расчёт ведётся геодезически через `pyproj.Geod` (эллипсоид WGS84).
+
+**3. Семплирование ЦМР**
+
+Для восстановленной цепочки координат из кэша ЦМР (весь растр загружается в RAM) извлекаются высоты в каждой точке. Кэш строится однократно при старте поиска функцией `load_dsm_cache`.
+
+**4. Оценка качества**
+
+Сравниваются высоты из CSV (`Z_DSM`) и высоты, снятые с ЦМР. Вычисляются:
+- **RMSE** — среднеквадратичное отклонение
+- **MAE** — среднее абсолютное отклонение
+- **Pearson r** — коэффициент корреляции
+
+Итоговая скор-функция: `score = RMSE × (1 + (1 − corr)) + 0.1 × MAE`. Меньше — лучше.
+
+**5. Уточнение (refinement)**
+
+После грубого прохода выполняется `refine_iterations` итераций локального уточнения вокруг лучшего кандидата. На каждой итерации шаг сетки и радиус уменьшаются вдвое (минимум 0.5 м). Уточнение прерывается досрочно, если улучшения не найдено и шаг ≤ 0.5 м.
+
+**6. Финальный проход и проверка качества**
+
+По найденной лучшей позиции последней точки восстанавливается финальная цепочка и пересчитываются метрики по исходным (несглаженным) высотам. Если `RMSE > 15.0 м` — в лог выводится предупреждение о ненадёжности результата.
+
+---
+
+## Структура проекта
+
+```
+ProfileFinder/
+├── core.py                  # Алгоритм поиска
+├── app.py                   # GUI (tkinter)
+├── line_profile_locator.py  # CLI-версия (click)
+├── requirements.txt         # Зависимости Python
+├── build.bat                # Сборка .exe через PyInstaller
+├── input.csv                # Пример входного профиля
+└── output.csv               # Пример выходного результата
+```
+
+---
+
+## Модули
+
+### `core.py` — вычислительное ядро
+
+| Функция / класс | Назначение |
+|---|---|
+| `ProfilePoint` | Датакласс одной точки профиля: азимут, расстояние, высота |
+| `SearchResult` | Датакласс результата: координаты первой и последней точки, метрики, полный список точек |
+| `DsmCache` | Кэш ЦМР в памяти: массив numpy, трансформ, размеры |
+| `load_dsm_cache(src, band)` | Загружает растр в RAM, заменяет nodata на NaN |
+| `sample_cache(cache, lons, lats)` | Векторизованное извлечение высот из кэша по массивам координат |
+| `load_profile(path, ...)` | Читает CSV, автоопределяет разделитель, возвращает `List[ProfilePoint]` |
+| `build_chain_backwards(last_lon, last_lat, profile)` | Геодезическое восстановление цепочки назад от последней точки |
+| `smooth(arr, window)` | Скользящее среднее с pad-выравниванием |
+| `compute_metrics(ref, sampled)` | Вычисляет RMSE, MAE, Pearson r, число валидных точек |
+| `score(rmse, corr, mae)` | Скалярная оценка качества кандидата |
+| `_generate_candidates(...)` | Генерирует полярную сетку кандидатов с фильтрацией по конусу азимутов |
+| `run_search(...)` | Главная функция: грубый поиск → уточнение → финальный проход → проверка RMSE |
+
+**Параметры `run_search`:**
+
+| Параметр | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `dsm_path` | str | — | Путь к GeoTIFF ЦМР |
+| `profile` | List[ProfilePoint] | — | Профиль из `load_profile` |
+| `approx_last_lon/lat` | float | — | Приближённая координата последней точки |
+| `search_radius_m` | float | — | Радиус поиска, метры |
+| `coarse_grid_m` | float | 25.0 | Шаг грубой сетки, метры |
+| `bearing_cone_deg` | float | 45.0 | Полуширина конуса азимутов, градусы |
+| `smooth_window` | int | 1 | Окно сглаживания высот (1 = без сглаживания) |
+| `refine_iterations` | int | 2 | Число итераций уточнения |
+| `band` | int | 1 | Номер канала ЦМР |
+| `progress_cb` | Callable | None | Колбэк прогресса: принимает float 0..1 |
+| `stop_event` | threading.Event | None | Флаг прерывания поиска |
+| `log_cb` | Callable | None | Колбэк лога: принимает строку |
+
+---
+
+### `app.py` — GUI на tkinter
+
+Графический интерфейс. Запускается напрямую: `python app.py`.
+
+**Класс `App`** наследует `tk.Tk` и содержит:
+
+| Метод | Что делает |
+|---|---|
+| `_build_ui()` | Строит всю разметку: фреймы для файлов, параметров, кнопок, прогресс-бар, лог |
+| `_load_settings()` | Читает `settings.json`, восстанавливает все поля; мигрирует старые ключи |
+| `_save_settings()` | Сохраняет текущее состояние всех полей в `settings.json` |
+| `_load_csv_columns(path, restore_fields)` | Читает заголовки CSV, заполняет комбобоксы. При `restore_fields=True` — автоподставляет колонки по имени (только при выборе файла вручную). При `restore_fields=False` (восстановление из настроек) — не перезаписывает сохранённые значения |
+| `_browse_csv()` | Диалог выбора CSV; вызывает `_load_csv_columns(..., restore_fields=True)` |
+| `_on_run()` | Валидирует параметры, сохраняет настройки, запускает `worker` в отдельном потоке |
+| `_on_stop()` | Устанавливает `stop_event` для прерывания поиска |
+| `_on_done(result)` | Выводит итоговые метрики в лог, активирует кнопки сохранения |
+| `_on_error(tb)` | Показывает traceback в логе и messagebox |
+| `_save_csv()` | Сохраняет результат в CSV через `write_result_csv` |
+| `_save_geojson()` | Сохраняет результат в GeoJSON через `write_result_geojson` |
+| `_update_mode_state()` | Переключает активность комбобоксов/полей в зависимости от режима (поле/константа) |
+
+**Настройки** сохраняются автоматически при закрытии окна и перед каждым запуском поиска в файл `settings.json` рядом с `app.py`.
+
+**Источники азимута и расстояния** переключаются независимо:
+- **CSV column** — значение берётся из указанного поля CSV
+- **Constant** — фиксированное значение для всех точек
+
+**Форматы вывода:**
+- **CSV** — таблица точек: Id, Lon, Lat, Z_DSM, BEAR_PREV, DIST_PREV_m, Z_sampled, dZ
+- **GeoJSON** (FeatureCollection, CRS84) — точки + линия с метриками в properties
+
+---
+
+### `line_profile_locator.py` — CLI
+
+Альтернативный запуск без GUI через `click`:
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
+python line_profile_locator.py \
+  --dsm path/to/dem.tif \
+  --csv path/to/profile.csv \
+  --lon 37.123456 \
+  --lat 55.654321 \
+  --radius 1000 \
+  --grid 25 \
+  --cone 45
+```
+
+Выводит результат в stdout и сохраняет выходной CSV/GeoJSON.
+
+---
+
+## Установка и запуск
+
+### Из исходников
+
+```bash
 pip install -r requirements.txt
 python app.py
 ```
 
-## Build standalone .exe
+### Сборка .exe (Windows)
 
 ```bat
 build.bat
 ```
 
-Output: `dist\ProfileFinder.exe`
+Собирает однофайловый исполняемый файл через PyInstaller.
 
-## Dependencies
+### Зависимости
 
-- [rasterio](https://rasterio.readthedocs.io/) — DSM raster reading and sampling
-- [pyproj](https://pyproj4.github.io/pyproj/) — WGS84 geodesic distance calculations
-- [numpy](https://numpy.org/) — profile comparison metrics
-- [PyInstaller](https://pyinstaller.org/) — standalone .exe packaging
+| Библиотека | Версия | Назначение |
+|---|---|---|
+| rasterio | ≥ 1.3 | Чтение GeoTIFF ЦМР |
+| numpy | ≥ 1.24 | Векторные вычисления |
+| pyproj | ≥ 3.5 | Геодезические расчёты (WGS84) |
+| click | ≥ 8.1 | CLI-интерфейс |
+| pyinstaller | ≥ 6.0 | Сборка .exe |
+
+---
+
+## Входные данные
+
+### CSV профиля
+
+Обязательные колонки (имена настраиваются в GUI):
+- `BEAR_PREV` — азимут от предыдущей точки, градусы (0–360)
+- `DIST_PREV` — расстояние от предыдущей точки, метры (или градусы — выбирается в GUI)
+- `Z_DSM` — высота точки по ЦМР, метры
+
+Разделитель определяется автоматически (`,` `;` `\t` `|`). Кодировка UTF-8 (BOM поддерживается).
+
+### ЦМР
+
+Формат GeoTIFF, любая проекция (координаты точек профиля пересчитываются через pyproj). Весь растр загружается в RAM при запуске поиска.
+
+---
+
+## Выходные данные
+
+### Метрики в логе
+
+| Метрика | Описание |
+|---|---|
+| RMSE | Среднеквадратичное отклонение Z_DSM от высот ЦМР, метры |
+| MAE | Среднее абсолютное отклонение, метры |
+| Pearson r | Коэффициент корреляции Z_DSM и высот ЦМР |
+| Offset | Смещение найденной последней точки от приближённой координаты, метры |
+| Matched | Число точек с валидными высотами ЦМР |
+
+Если `RMSE > 15.0 м` — выводится предупреждение `WARNING: RMSE=... exceeds threshold`. Это сигнал проверить приближённую координату или увеличить радиус поиска.
+
+### CSV результата
+
+```
+Id, Lon, Lat, Z_DSM, BEAR_PREV, DIST_PREV_m, Z_sampled, dZ
+```
+
+### GeoJSON результата
+
+FeatureCollection с:
+- точками профиля (тип `Point`, все атрибуты в properties)
+- линией профиля (тип `LineString`) с полями RMSE, MAE, Pearson, Matched, PerpOffset_m
+
+---
+
+## Рекомендации по параметрам
+
+| Ситуация | Рекомендация |
+|---|---|
+| Неизвестное положение профиля | `search_radius` 500–2000 м, `coarse_grid` 25–50 м |
+| Приближённая координата точная (< 100 м) | `search_radius` 100–200 м, `coarse_grid` 5–10 м |
+| Шумные высоты Z_DSM | `smooth_window` 3–5 |
+| Прямолинейный профиль | `bearing_cone` 15–20° |
+| Профиль с изгибами | `bearing_cone` 45–90° (азимут берётся только последнего сегмента) |
+| RMSE > 15 м после поиска | Увеличить `search_radius`, проверить правильность приближённой координаты, убедиться в соответствии ЦМР и дат съёмки профиля |
