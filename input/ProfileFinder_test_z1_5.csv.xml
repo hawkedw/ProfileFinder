@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xml:lang="ru"><Esri><CreaDate>20260422</CreaDate><CreaTime>21220600</CreaTime><ArcGISFormat>1.0</ArcGISFormat><SyncOnce>TRUE</SyncOnce><DataProperties><lineage><Process ToolSource="F:\EkoNiva\relief\relief.tbx\profilePoints" Date="20260422" Time="212206">profilePoints F:\Work\SWARM\InputTopo.gdb\RouteLayers\RouteLines 7 1 F:\SARM\rastr\DSM.tif 1.5 F:\Work\SWARM\InputTopo.gdb\RouteLayers\RoutePoints_v4_z1_5 F:\ProfileFinder\Input\ProfileFinder_test_z1_5.csv</Process></lineage></DataProperties></Esri></metadata>
